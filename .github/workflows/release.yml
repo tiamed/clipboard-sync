@@ -1,0 +1,99 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build imagecopy for ${{ matrix.arch }}
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            swiftc -target arm64-apple-macosx11.0 macos/imagecopy.swift -o imagecopy-arm64
+          else
+            swiftc -target x86_64-apple-macosx11.0 macos/imagecopy.swift -o imagecopy-x86_64
+          fi
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagecopy-${{ matrix.arch }}
+          path: imagecopy-*
+
+  release:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create release assets
+        run: |
+          mkdir -p release
+          mv artifacts/imagecopy-arm64/imagecopy-arm64 release/
+          mv artifacts/imagecopy-x86_64/imagecopy-x86_64 release/
+          chmod +x release/*
+          
+      - name: Create SHA256 checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+      
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=v0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: Clipboard Sync ${{ steps.version.outputs.VERSION }}
+          files: release/*
+          body: |
+            ## Installation
+            
+            ### Linux
+            
+            ```bash
+            git clone https://github.com/tiamed/clipboard-sync.git
+            cd clipboard-sync
+            ./scripts/install.sh
+            ```
+            
+            ### macOS (imagecopy helper)
+            
+            ```bash
+            curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
+            ```
+            
+            Or manually:
+            ```bash
+            # Download the binary for your architecture
+            # arm64 (M1/M2/M3 Macs)
+            curl -Lo ~/scripts/imagecopy https://github.com/tiamed/clipboard-sync/releases/download/${{ steps.version.outputs.VERSION }}/imagecopy-arm64
+            
+            # x86_64 (Intel Macs)
+            curl -Lo ~/scripts/imagecopy https://github.com/tiamed/clipboard-sync/releases/download/${{ steps.version.outputs.VERSION }}/imagecopy-x86_64
+            
+            chmod +x ~/scripts/imagecopy
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -21,59 +21,65 @@ Bidirectional clipboard synchronization between Linux (Wayland) and macOS.
 ### macOS
 - SSH server enabled
 - `pbcopy`/`pbpaste` (built-in)
-- [imagecopy](#macos-setup) helper script
+- [imagecopy](#macos-setup) helper (auto-installed)
 
 ## Quick Start
 
+### Linux
+
 ```bash
-cd ~/projects/clipboard-sync
-./scripts/install.sh
+curl -sSL https://tiamed.github.io/clipboard-sync/install-linux.sh | bash
 ```
 
-Edit the config file with your Mac's details:
-
+Then edit the config:
 ```bash
 nano ~/.config/clipboard-sync/config.ini
 ```
 
 Start the service:
-
 ```bash
 systemctl --user enable --now clipboard-sync
 ```
 
+### macOS
+
+```bash
+curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
+```
+
 ## Installation
 
-### 1. Install Dependencies
+### Linux
 
-**Ubuntu/Debian:**
+**One-liner (recommended):**
+```bash
+curl -sSL https://tiamed.github.io/clipboard-sync/install-linux.sh | bash
+```
+
+**Install dependencies manually:**
+
+Ubuntu/Debian:
 ```bash
 sudo apt install wl-clipboard libnotify-bin
 ```
 
-**Arch Linux:**
+Arch Linux:
 ```bash
 sudo pacman -S wl-clipboard libnotify
 ```
 
-**Fedora:**
+Fedora:
 ```bash
 sudo dnf install wl-clipboard libnotify
 ```
 
-### 2. Run Installer
-
-```bash
-./scripts/install.sh [PREFIX]
-```
-
-Default prefix is `~/.local`. Files installed:
+**Files installed:**
 - `~/.local/bin/clipboard-sync` - Main executable
 - `~/.config/clipboard-sync/config.ini` - Configuration
 - `~/.local/state/clipboard-sync/` - State files
 - `~/.config/systemd/user/clipboard-sync.service` - Systemd service
 
-### 3. Configure
+### Configuration
 
 Edit `~/.config/clipboard-sync/config.ini`:
 
@@ -96,7 +102,7 @@ enabled = true
 options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10
 ```
 
-### 4. Setup SSH Keys
+### SSH Setup
 
 Ensure passwordless SSH works to your Mac:
 
@@ -105,7 +111,7 @@ ssh-copy-id your_mac_username@your_mac_host
 ssh your_mac_username@your_mac_host "echo OK"
 ```
 
-### 5. Start Service
+### Start Service
 
 ```bash
 systemctl --user enable --now clipboard-sync
@@ -114,31 +120,35 @@ systemctl --user status clipboard-sync
 
 ## macOS Setup
 
-On your Mac, install the helper scripts:
+The `imagecopy` helper is required for image sync. Install it with one command:
+
+```bash
+curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
+```
+
+This downloads a pre-compiled binary for your architecture (Intel or Apple Silicon).
+
+**Manual installation:**
 
 ```bash
 mkdir -p ~/scripts
-cp macos/imagecopy.swift ~/scripts/imagecopy.swift
-cp macos/notify.swift ~/scripts/notify.swift
-
-chmod +x ~/scripts/imagecopy.swift
-chmod +x ~/scripts/notify.swift
-
-ln -sf ~/scripts/imagecopy.swift ~/scripts/imagecopy
-ln -sf ~/scripts/notify.swift ~/scripts/notify
+curl -Lo ~/scripts/imagecopy https://github.com/tiamed/clipboard-sync/releases/latest/download/imagecopy-$(uname -m)
+chmod +x ~/scripts/imagecopy
 ```
 
-Or compile for faster execution:
+**From source:**
 
 ```bash
+mkdir -p ~/scripts
 swiftc macos/imagecopy.swift -o ~/scripts/imagecopy
-swiftc macos/notify.swift -o ~/scripts/notify
-chmod +x ~/scripts/imagecopy ~/scripts/notify
+chmod +x ~/scripts/imagecopy
 ```
 
-**Files:**
-- `imagecopy.swift` - Copy images to/from clipboard (required for image sync)
-- `notify.swift` - Desktop notifications (optional)
+**Usage:**
+```bash
+~/scripts/imagecopy /path/to/image.png     # Push image to clipboard
+~/scripts/imagecopy -o /path/to/output.png # Save clipboard image to file
+```
 
 ## Configuration Reference
 
