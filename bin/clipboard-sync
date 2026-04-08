@@ -1,0 +1,416 @@
+#!/bin/bash
+#
+# clipboard-sync
+# Syncs clipboard bidirectionally between Linux (Wayland) and macOS
+# Requirements: wl-paste, wl-copy, ssh, scp, iconv, sha256sum
+#
+# Configuration: ~/.config/clipboard-sync/config.ini
+# State: ~/.local/state/clipboard-sync/
+#
+
+set -euo pipefail
+
+# === CONFIGURATION DEFAULTS ===
+declare -g REMOTE_USER=""
+declare -g REMOTE_HOST=""
+declare -g MACOS_IMAGE_COPY_PATH=""
+declare -g MIN_LENGTH="1"
+declare -g POLL_INTERVAL="1"
+declare -g ENABLE_TEXT="true"
+declare -g ENABLE_IMAGE="true"
+declare -g NOTIFICATIONS_ENABLED="true"
+declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5"
+
+# === PATHS ===
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_FILE="$HOME/.config/clipboard-sync/config.ini"
+readonly STATE_DIR="$HOME/.local/state/clipboard-sync"
+readonly STATE_TEXT_HASH="$STATE_DIR/text_hash"
+readonly STATE_IMAGE_HASH="$STATE_DIR/image_hash"
+readonly TEMP_DIR="/tmp/clipboard_sync_$$"
+
+# === STATE ===
+LAST_TEXT_HASH=""
+LAST_IMAGE_HASH=""
+
+# === INI PARSER ===
+parse_config() {
+    local config_file="$1"
+    local current_section=""
+    
+    if [[ ! -f "$config_file" ]]; then
+        echo "Warning: Config file not found at $config_file, using defaults" >&2
+        return 1
+    fi
+    
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        
+        # Check for section headers
+        if [[ "$line" =~ ^\[([^\]]+)\] ]]; then
+            current_section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        
+        # Parse key=value pairs
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            
+            # Trim whitespace
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs)
+            
+            # Map config keys to variables based on section
+            case "$current_section" in
+                remote)
+                    case "$key" in
+                        user) REMOTE_USER="$value" ;;
+                        host) REMOTE_HOST="$value" ;;
+                        image_copy_path) MACOS_IMAGE_COPY_PATH="$value" ;;
+                    esac
+                    ;;
+                sync)
+                    case "$key" in
+                        min_length) MIN_LENGTH="$value" ;;
+                        poll_interval) POLL_INTERVAL="$value" ;;
+                        enable_text) ENABLE_TEXT="$value" ;;
+                        enable_image) ENABLE_IMAGE="$value" ;;
+                    esac
+                    ;;
+                notifications)
+                    case "$key" in
+                        enabled) NOTIFICATIONS_ENABLED="$value" ;;
+                    esac
+                    ;;
+                ssh)
+                    case "$key" in
+                        options) SSH_OPTS="$value" ;;
+                    esac
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+    
+    return 0
+}
+
+validate_config() {
+    local errors=0
+    
+    if [[ -z "$REMOTE_USER" ]]; then
+        echo "Error: remote.user not configured" >&2
+        errors=$((errors + 1))
+    fi
+    
+    if [[ -z "$REMOTE_HOST" ]]; then
+        echo "Error: remote.host not configured" >&2
+        errors=$((errors + 1))
+    fi
+    
+    if [[ $errors -gt 0 ]]; then
+        echo "Please configure $CONFIG_FILE" >&2
+        return 1
+    fi
+    
+    return 0
+}
+
+# === SETUP ===
+setup() {
+    mkdir -p "$TEMP_DIR"
+    chmod 700 "$TEMP_DIR" 2>/dev/null || true
+    
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+    
+    touch "$STATE_TEXT_HASH" "$STATE_IMAGE_HASH"
+    LAST_TEXT_HASH=$(cat "$STATE_TEXT_HASH" 2>/dev/null || echo "")
+    LAST_IMAGE_HASH=$(cat "$STATE_IMAGE_HASH" 2>/dev/null || echo "")
+}
+
+cleanup() {
+    rm -rf "$TEMP_DIR" 2>/dev/null || true
+    exit 0
+}
+trap cleanup EXIT INT TERM
+
+# === UTILITIES ===
+
+# Ensure string is valid UTF-8 and strip null bytes
+ensure_utf8() {
+    local input="$1"
+    echo -n "$input" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr -d '\000' || echo -n "$input"
+}
+
+# Get SHA-256 hash of text (trailing whitespace trimmed)
+get_text_hash() {
+    echo -n "$1" | sed 's/[[:space:]]*$//' | sha256sum | awk '{print $1}'
+}
+
+# Get SHA-256 hash of file
+get_file_hash() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+# Escape notification content for notify-send
+escape_notification() {
+    local text="$1"
+    # Prepend space to prevent leading dash interpretation
+    echo " $text" | sed 's/%/%%/g; s/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Check SSH connection health
+check_connection() {
+    ssh -n $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "true" 2>/dev/null
+}
+
+# === PUSH OPERATIONS (Linux → macOS) ===
+
+push_text_to_macos() {
+    local text="$1"
+    printf '%s' "$text" | ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+        "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
+}
+
+push_image_to_macos() {
+    local img="$1"
+    scp -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
+    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+        "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
+}
+
+# === PULL OPERATIONS (macOS → Linux) ===
+
+pull_text_from_macos() {
+    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+        "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
+}
+
+pull_image_from_macos() {
+    local tmp="$TEMP_DIR/macos_image_$$.png"
+    local mac_path
+
+    # Try to copy image from macOS
+    mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+        "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
+
+    # Validate returned path
+    if [[ -z "$mac_path" ]] || [[ "$mac_path" == *\** ]] || [[ "$mac_path" != /tmp/* ]]; then
+        return 1
+    fi
+
+    scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
+    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
+
+    if [[ -s "$tmp" ]]; then
+        echo "$tmp"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# === NOTIFICATIONS ===
+
+notify_linux() {
+    local title="$1"
+    local content="$2"
+    
+    if [[ "$NOTIFICATIONS_ENABLED" != "true" ]]; then
+        return
+    fi
+    
+    local escaped_title escaped_content
+
+    escaped_title=$(escape_notification "$title")
+    escaped_content=$(escape_notification "$content")
+
+    notify-send "$escaped_title" "$escaped_content" 2>/dev/null || true
+}
+
+notify_macos() {
+    local title="$1"
+    local content="$2"
+    
+    if [[ "$NOTIFICATIONS_ENABLED" != "true" ]]; then
+        return
+    fi
+    
+    local truncated=""
+
+    if [[ ${#content} -gt 100 ]]; then
+        truncated="${content:0:100}..."
+    else
+        truncated="$content"
+    fi
+
+    truncated=$(printf '%s' "$truncated" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+        "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
+}
+
+# === LINUX POLLING ===
+
+poll_linux_text() {
+    if [[ "$ENABLE_TEXT" != "true" ]]; then
+        return
+    fi
+    
+    local linux_text
+    linux_text=$(wl-paste -t text/plain 2>/dev/null || echo "")
+
+    if [[ ${#linux_text} -lt $MIN_LENGTH ]]; then
+        return
+    fi
+
+    linux_text=$(ensure_utf8 "$linux_text")
+    local current_hash
+    current_hash=$(get_text_hash "$linux_text")
+
+    if [[ "$current_hash" != "$LAST_TEXT_HASH" ]]; then
+        if check_connection && push_text_to_macos "$linux_text"; then
+            LAST_TEXT_HASH="$current_hash"
+            echo "$LAST_TEXT_HASH" > "$STATE_TEXT_HASH"
+            echo "[$(date '+%H:%M:%S')] Text pushed to macOS"
+            notify_macos "Clipboard Sync" "$linux_text"
+        fi
+    fi
+}
+
+poll_linux_image() {
+    if [[ "$ENABLE_IMAGE" != "true" ]]; then
+        return
+    fi
+    
+    local image_type
+    image_type=$(wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
+
+    if [[ -z "$image_type" ]]; then
+        return
+    fi
+
+    local tmp_img="$TEMP_DIR/linux_image_$$.${image_type#image/}"
+    if ! wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null; then
+        rm -f "$tmp_img"
+        return
+    fi
+
+    if [[ ! -s "$tmp_img" ]]; then
+        rm -f "$tmp_img"
+        return
+    fi
+
+    local current_hash
+    current_hash=$(get_file_hash "$tmp_img")
+
+    if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
+        if check_connection && push_image_to_macos "$tmp_img"; then
+            LAST_IMAGE_HASH="$current_hash"
+            echo "$LAST_IMAGE_HASH" > "$STATE_IMAGE_HASH"
+            echo "[$(date '+%H:%M:%S')] Image pushed to macOS"
+            notify_macos "Clipboard Sync" "Image received from Linux"
+        fi
+    fi
+
+    rm -f "$tmp_img"
+}
+
+# === MACOS POLLING ===
+
+poll_macos_text() {
+    if [[ "$ENABLE_TEXT" != "true" ]]; then
+        return
+    fi
+    
+    local mac_text
+    mac_text=$(pull_text_from_macos)
+
+    if [[ ${#mac_text} -lt $MIN_LENGTH ]]; then
+        return
+    fi
+
+    mac_text=$(ensure_utf8 "$mac_text")
+    local current_hash
+    current_hash=$(get_text_hash "$mac_text")
+
+    if [[ "$current_hash" != "$LAST_TEXT_HASH" ]]; then
+        if printf '%s' "$mac_text" | wl-copy -t text/plain 2>/dev/null; then
+            LAST_TEXT_HASH="$current_hash"
+            echo "$LAST_TEXT_HASH" > "$STATE_TEXT_HASH"
+            echo "[$(date '+%H:%M:%S')] Text pulled from macOS"
+            notify_linux "Clipboard Sync" "$mac_text"
+        fi
+    fi
+}
+
+poll_macos_image() {
+    if [[ "$ENABLE_IMAGE" != "true" ]]; then
+        return
+    fi
+    
+    local tmp_mac_img
+    tmp_mac_img=$(pull_image_from_macos) || return
+
+    if [[ ! -f "$tmp_mac_img" ]]; then
+        return
+    fi
+
+    local current_hash
+    current_hash=$(get_file_hash "$tmp_mac_img")
+
+    if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
+        if wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
+            LAST_IMAGE_HASH="$current_hash"
+            echo "$LAST_IMAGE_HASH" > "$STATE_IMAGE_HASH"
+            echo "[$(date '+%H:%M:%S')] Image pulled from macOS"
+            notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+        fi
+    fi
+
+    rm -f "$tmp_mac_img"
+}
+
+# === MAIN LOOP ===
+
+main() {
+    # Parse configuration
+    parse_config "$CONFIG_FILE" || true
+    
+    # Validate required configuration
+    if ! validate_config; then
+        exit 1
+    fi
+    
+    # Initialize
+    setup
+
+    echo "Clipboard sync started (Linux ←→ macOS)"
+    echo "Remote: $REMOTE_USER@$REMOTE_HOST"
+    echo "Config: $CONFIG_FILE"
+    echo "State: $STATE_DIR"
+    echo "Text sync: $ENABLE_TEXT"
+    echo "Image sync: $ENABLE_IMAGE"
+    echo "Polling interval: ${POLL_INTERVAL}s"
+    echo "Monitoring..."
+
+    while true; do
+        # Linux → macOS
+        poll_linux_text
+        poll_linux_image
+
+        # macOS → Linux
+        poll_macos_text
+        poll_macos_image
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+main

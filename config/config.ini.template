@@ -1,0 +1,26 @@
+# Clipboard Sync Configuration
+# Copy this file to ~/.config/clipboard-sync/config.ini and edit as needed
+
+[remote]
+# macOS remote connection settings
+user = YOUR_MAC_USERNAME
+host = YOUR_MAC_HOSTNAME_OR_IP
+# Path to imagecopy helper script on macOS (required for image sync)
+image_copy_path = /Users/YOUR_MAC_USERNAME/scripts/imagecopy
+
+[sync]
+# Minimum text length to sync (avoid syncing tiny snippets)
+min_length = 1
+# Polling interval in seconds
+poll_interval = 1
+# Enable/disable sync types
+enable_text = true
+enable_image = true
+
+[notifications]
+# Show notifications when clipboard syncs
+enabled = true
+
+[ssh]
+# SSH connection options
+options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5

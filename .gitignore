@@ -1,0 +1,28 @@
+# State files
+.clipboard_last_*
+
+# User configs (keep template)
+config/config.ini
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test artifacts
+test/tmp/
+test/output/

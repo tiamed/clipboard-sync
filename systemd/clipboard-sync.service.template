@@ -1,0 +1,13 @@
+[Unit]
+Description=Clipboard sync between Linux and macOS
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={{INSTALL_PREFIX}}/bin/clipboard-sync
+Restart=always
+RestartSec=10
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
