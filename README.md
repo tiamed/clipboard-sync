@@ -166,6 +166,27 @@ chmod +x ~/scripts/imagecopy
 
 ## Usage
 
+### One-Shot Commands
+
+Use these to immediately sync without waiting for the next polling cycle. Ideal for keyboard shortcuts or window manager hooks.
+
+```bash
+# Push Linux clipboard to macOS (auto-detects text or image)
+clipboard-sync sync-to
+
+# Pull macOS clipboard to Linux (tries image first, falls back to text)
+clipboard-sync sync-from
+
+# Show help
+clipboard-sync --help
+```
+
+**Keyboard shortcut examples (sway/i3/hyprland):**
+```
+bindsym $mod+Shift+c exec clipboard-sync sync-to
+bindsym $mod+Shift+v exec clipboard-sync sync-from
+```
+
 ### Start/Stop Service
 
 ```bash
@@ -180,9 +201,10 @@ systemctl --user restart clipboard-sync
 journalctl --user -u clipboard-sync -f
 ```
 
-### Manual Run
+### Continuous Daemon
 
 ```bash
+# Run without arguments for continuous polling (default)
 ~/.local/bin/clipboard-sync
 ```
 

@@ -134,7 +134,6 @@ setup() {
 
 cleanup() {
     rm -rf "$TEMP_DIR" 2>/dev/null || true
-    exit 0
 }
 trap cleanup EXIT INT TERM
 
@@ -377,18 +376,140 @@ poll_macos_image() {
     rm -f "$tmp_mac_img"
 }
 
+# === ONE-SHOT COMMANDS ===
+
+cmd_sync_to() {
+    # One-shot push Linux clipboard to macOS
+    if ! check_connection; then
+        echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
+        return 1
+    fi
+
+    # Try image first
+    if [[ "$ENABLE_IMAGE" == "true" ]]; then
+        local image_type
+        image_type=$(wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
+
+        if [[ -n "$image_type" ]]; then
+            local tmp_img="$TEMP_DIR/sync_to_image_$$.${image_type#image/}"
+            if wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null && [[ -s "$tmp_img" ]]; then
+                if push_image_to_macos "$tmp_img"; then
+                    rm -f "$tmp_img"
+                    notify_macos "Clipboard Sync" "Image received from Linux"
+                    echo "Image synced to macOS"
+                    return 0
+                else
+                    rm -f "$tmp_img"
+                    echo "Error: failed to push image to macOS" >&2
+                    return 1
+                fi
+            fi
+            rm -f "$tmp_img"
+        fi
+    fi
+
+    # Fall back to text
+    if [[ "$ENABLE_TEXT" == "true" ]]; then
+        local linux_text
+        linux_text=$(wl-paste -t text/plain 2>/dev/null || echo "")
+
+        if [[ ${#linux_text} -ge $MIN_LENGTH ]]; then
+            linux_text=$(ensure_utf8 "$linux_text")
+            if push_text_to_macos "$linux_text"; then
+                notify_macos "Clipboard Sync" "$linux_text"
+                echo "Text synced to macOS (${#linux_text} chars)"
+                return 0
+            else
+                echo "Error: failed to push text to macOS" >&2
+                return 1
+            fi
+        fi
+    fi
+
+    echo "Nothing to sync (clipboard empty or below min length)"
+    return 0
+}
+
+cmd_sync_from() {
+    # One-shot pull macOS clipboard to Linux
+    if ! check_connection; then
+        echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
+        return 1
+    fi
+
+    # Try image first
+    if [[ "$ENABLE_IMAGE" == "true" ]]; then
+        local tmp_mac_img
+        tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
+
+        if [[ -n "$tmp_mac_img" ]] && [[ -f "$tmp_mac_img" ]]; then
+            if wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
+                rm -f "$tmp_mac_img"
+                notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+                echo "Image synced from macOS"
+                return 0
+            else
+                rm -f "$tmp_mac_img"
+                echo "Warning: image pull succeeded but wl-copy failed, trying text" >&2
+            fi
+        else
+            [[ -n "$tmp_mac_img" ]] && rm -f "$tmp_mac_img"
+        fi
+    fi
+
+    # Fall back to text
+    if [[ "$ENABLE_TEXT" == "true" ]]; then
+        local mac_text
+        mac_text=$(pull_text_from_macos)
+
+        if [[ ${#mac_text} -ge $MIN_LENGTH ]]; then
+            mac_text=$(ensure_utf8 "$mac_text")
+            if printf '%s' "$mac_text" | wl-copy -t text/plain 2>/dev/null; then
+                notify_linux "Clipboard Sync" "$mac_text"
+                echo "Text synced from macOS (${#mac_text} chars)"
+                return 0
+            else
+                echo "Error: failed to copy text to Linux clipboard" >&2
+                return 1
+            fi
+        fi
+    fi
+
+    echo "Nothing to sync from macOS (clipboard empty or below min length)"
+    return 0
+}
+
+# === USAGE ===
+
+show_usage() {
+    cat << 'EOF'
+Usage: clipboard-sync [COMMAND]
+
+Commands:
+  (none)     Run in continuous polling daemon mode
+  sync-to    Push Linux clipboard to macOS (one-shot, auto-detect type)
+  sync-from  Pull macOS clipboard to Linux (one-shot, auto-detect type)
+
+Options:
+  -h, --help  Show this help message
+
+Configuration: ~/.config/clipboard-sync/config.ini
+State:        ~/.local/state/clipboard-sync/
+
+Examples:
+  clipboard-sync              # Start continuous sync daemon
+  clipboard-sync sync-to      # Immediately push Linux clipboard to macOS
+  clipboard-sync sync-from    # Immediately pull macOS clipboard to Linux
+
+Keyboard shortcut examples (for sway/i3/hyprland):
+  bindsym $mod+Shift+c exec clipboard-sync sync-to
+  bindsym $mod+Shift+v exec clipboard-sync sync-from
+EOF
+}
+
 # === MAIN LOOP ===
 
-main() {
-    # Parse configuration
-    parse_config "$CONFIG_FILE" || true
-    
-    # Validate required configuration
-    if ! validate_config; then
-        exit 1
-    fi
-    
-    # Initialize
+run_daemon() {
     setup
 
     echo "Clipboard sync started (Linux ←→ macOS)"
@@ -413,4 +534,38 @@ main() {
     done
 }
 
-main
+main() {
+    # Parse configuration
+    parse_config "$CONFIG_FILE" || true
+
+    case "${1:-}" in
+        sync-to)
+            mkdir -p "$TEMP_DIR"
+            chmod 700 "$TEMP_DIR" 2>/dev/null || true
+            validate_config || exit 1
+            cmd_sync_to
+            ;;
+        sync-from)
+            mkdir -p "$TEMP_DIR"
+            chmod 700 "$TEMP_DIR" 2>/dev/null || true
+            validate_config || exit 1
+            cmd_sync_from
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        "")
+            # Daemon mode (default, backward compatible)
+            validate_config || exit 1
+            run_daemon
+            ;;
+        *)
+            echo "Unknown command: $1" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
