@@ -91,6 +91,9 @@ enabled = true
 
 [ssh]
 options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5
+# SSH multiplexing - reduces latency by 20-100x
+mux_enabled = true
+mux_persist = 300
 EOF
         log_warn "Please edit $CONFIG_DIR/config.ini with your settings"
     else

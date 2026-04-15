@@ -20,6 +20,8 @@ declare -g ENABLE_TEXT="true"
 declare -g ENABLE_IMAGE="true"
 declare -g NOTIFICATIONS_ENABLED="true"
 declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5"
+declare -g SSH_MUX_ENABLED="true"
+declare -g SSH_MUX_PERSIST="300"
 
 # === PATHS ===
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +30,7 @@ readonly STATE_DIR="$HOME/.local/state/clipboard-sync"
 readonly STATE_TEXT_HASH="$STATE_DIR/text_hash"
 readonly STATE_IMAGE_HASH="$STATE_DIR/image_hash"
 readonly TEMP_DIR="/tmp/clipboard_sync_$$"
+readonly SSH_MUX_DIR="$HOME/.cache/clipboard-sync/ssh-mux"
 
 # === STATE ===
 LAST_TEXT_HASH=""
@@ -89,6 +92,8 @@ parse_config() {
                 ssh)
                     case "$key" in
                         options) SSH_OPTS="$value" ;;
+                        mux_enabled) SSH_MUX_ENABLED="$value" ;;
+                        mux_persist) SSH_MUX_PERSIST="$value" ;;
                     esac
                     ;;
             esac
@@ -127,15 +132,74 @@ setup() {
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR" 2>/dev/null || true
     
+    # Setup SSH multiplexing directory
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        mkdir -p "$SSH_MUX_DIR"
+        chmod 700 "$SSH_MUX_DIR" 2>/dev/null || true
+    fi
+    
     touch "$STATE_TEXT_HASH" "$STATE_IMAGE_HASH"
     LAST_TEXT_HASH=$(cat "$STATE_TEXT_HASH" 2>/dev/null || echo "")
     LAST_IMAGE_HASH=$(cat "$STATE_IMAGE_HASH" 2>/dev/null || echo "")
 }
 
+# Get SSH socket path for current connection
+get_ssh_socket() {
+    # Use shorter hash to avoid path length issues with Unix domain sockets
+    # OpenSSH has a ~100 character limit on the ControlPath
+    local conn_string="${REMOTE_USER}@${REMOTE_HOST}"
+    local socket_hash
+    socket_hash=$(echo -n "$conn_string" | md5sum | awk '{print $1}' | cut -c1-16)
+    echo "$SSH_MUX_DIR/$socket_hash"
+}
+
+# Ensure SSH master connection is established (for multiplexing)
+ensure_ssh_master() {
+    if [[ "$SSH_MUX_ENABLED" != "true" ]]; then
+        return 0
+    fi
+    
+    local socket
+    socket=$(get_ssh_socket)
+    
+    # Check if master connection already exists
+    if [[ -S "$socket" ]]; then
+        # Verify it's still alive
+        if ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null; then
+            return 0
+        fi
+        # Dead socket, remove it
+        rm -f "$socket"
+    fi
+    
+    # Establish new master connection in background
+    ssh -fN -M -S "$socket" \
+        -o ControlPersist="$SSH_MUX_PERSIST" \
+        $SSH_OPTS \
+        "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null
+    
+    # Wait for socket to be created (up to 5 seconds)
+    local waited=0
+    while [[ ! -S "$socket" ]] && [[ $waited -lt 50 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    
+    [[ -S "$socket" ]]
+}
+
 cleanup() {
     rm -rf "$TEMP_DIR" 2>/dev/null || true
+    
+    # Close SSH master connection if we started it
+    if [[ "$SSH_MUX_ENABLED" == "true" ]] && [[ -n "${REMOTE_USER:-}" ]] && [[ -n "${REMOTE_HOST:-}" ]]; then
+        local socket
+        socket=$(get_ssh_socket 2>/dev/null) || return
+        if [[ -S "$socket" ]]; then
+            ssh -O exit -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null || true
+        fi
+    fi
 }
-trap cleanup EXIT INT TERM
 
 # === UTILITIES ===
 
@@ -164,29 +228,58 @@ escape_notification() {
 
 # Check SSH connection health
 check_connection() {
-    ssh -n $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "true" 2>/dev/null
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        ensure_ssh_master || return 1
+        local socket
+        socket=$(get_ssh_socket)
+        ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null
+    else
+        ssh -n $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "true" 2>/dev/null
+    fi
 }
 
 # === PUSH OPERATIONS (Linux → macOS) ===
 
 push_text_to_macos() {
     local text="$1"
-    printf '%s' "$text" | ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-        "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        printf '%s' "$text" | ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
+    else
+        printf '%s' "$text" | ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
+    fi
 }
 
 push_image_to_macos() {
     local img="$1"
-    scp -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
-    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-        "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        scp -o ControlPath="$socket" -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
+    else
+        scp -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
+    fi
 }
 
 # === PULL OPERATIONS (macOS → Linux) ===
 
 pull_text_from_macos() {
-    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-        "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
+    else
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
+    fi
 }
 
 pull_image_from_macos() {
@@ -194,16 +287,30 @@ pull_image_from_macos() {
     local mac_path
 
     # Try to copy image from macOS
-    mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-        "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        mac_path=$(ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
+    else
+        mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
+    fi
 
     # Validate returned path
     if [[ -z "$mac_path" ]] || [[ "$mac_path" == *\** ]] || [[ "$mac_path" != /tmp/* ]]; then
         return 1
     fi
 
-    scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
-    ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        scp -o ControlPath="$socket" -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
+    else
+        scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
+    fi
 
     if [[ -s "$tmp" ]]; then
         echo "$tmp"
@@ -250,9 +357,17 @@ notify_macos() {
     truncated=$(printf '%s' "$truncated" | sed 's/\\/\\\\/g; s/"/\\"/g')
     title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-    printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
-        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-        "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
+            ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
+    else
+        printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
+            ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
+    fi
 }
 
 # === LINUX POLLING ===
@@ -380,6 +495,14 @@ poll_macos_image() {
 
 cmd_sync_to() {
     # One-shot push Linux clipboard to macOS
+    # Establish master connection for multiplexing
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        ensure_ssh_master || {
+            echo "Warning: SSH multiplexing setup failed, using direct connection" >&2
+            SSH_MUX_ENABLED="false"
+        }
+    fi
+    
     if ! check_connection; then
         echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
         return 1
@@ -432,6 +555,14 @@ cmd_sync_to() {
 
 cmd_sync_from() {
     # One-shot pull macOS clipboard to Linux
+    # Establish master connection for multiplexing
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        ensure_ssh_master || {
+            echo "Warning: SSH multiplexing setup failed, using direct connection" >&2
+            SSH_MUX_ENABLED="false"
+        }
+    fi
+    
     if ! check_connection; then
         echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
         return 1
@@ -512,6 +643,17 @@ EOF
 run_daemon() {
     setup
 
+    # Establish SSH master connection for multiplexing
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        echo "Establishing SSH master connection..."
+        if ensure_ssh_master; then
+            echo "SSH multiplexing enabled (persist: ${SSH_MUX_PERSIST}s)"
+        else
+            echo "Warning: SSH multiplexing setup failed, falling back to direct connections"
+            SSH_MUX_ENABLED="false"
+        fi
+    fi
+
     echo "Clipboard sync started (Linux ←→ macOS)"
     echo "Remote: $REMOTE_USER@$REMOTE_HOST"
     echo "Config: $CONFIG_FILE"
@@ -540,16 +682,20 @@ main() {
 
     case "${1:-}" in
         sync-to)
+            # Don't register cleanup for one-shot commands - keep master connection alive
             mkdir -p "$TEMP_DIR"
             chmod 700 "$TEMP_DIR" 2>/dev/null || true
             validate_config || exit 1
             cmd_sync_to
+            exit $?
             ;;
         sync-from)
+            # Don't register cleanup for one-shot commands - keep master connection alive
             mkdir -p "$TEMP_DIR"
             chmod 700 "$TEMP_DIR" 2>/dev/null || true
             validate_config || exit 1
             cmd_sync_from
+            exit $?
             ;;
         -h|--help)
             show_usage
@@ -557,6 +703,7 @@ main() {
             ;;
         "")
             # Daemon mode (default, backward compatible)
+            trap cleanup EXIT INT TERM
             validate_config || exit 1
             run_daemon
             ;;

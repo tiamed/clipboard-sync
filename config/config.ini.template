@@ -24,3 +24,9 @@ enabled = true
 [ssh]
 # SSH connection options
 options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5
+# Enable SSH multiplexing (persistent connection) - reduces latency by 20-100x
+# After first connection, subsequent syncs are nearly instant
+mux_enabled = true
+# How long to keep the master connection alive after last use (seconds)
+# Recommended: 300 (5 min) for frequent sync, 60 for occasional
+mux_persist = 300
