@@ -162,13 +162,17 @@ ensure_ssh_master() {
     local socket
     socket=$(get_ssh_socket)
     
-    # Check if master connection already exists
+    # Check if master connection already exists and is alive
     if [[ -S "$socket" ]]; then
         # Verify it's still alive
         if ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null; then
             return 0
         fi
         # Dead socket, remove it
+        rm -f "$socket"
+    elif [[ -e "$socket" ]]; then
+        # Regular file exists at socket path (stale from previous failed attempt)
+        # Remove it before creating new socket
         rm -f "$socket"
     fi
     

@@ -107,6 +107,11 @@ install_systemd() {
     
     mkdir -p "$service_dir"
     
+    # Detect current display and Wayland environment
+    local display="${DISPLAY:-:0}"
+    local wayland_display="${WAYLAND_DISPLAY:-wayland-0}"
+    local xdg_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    
     cat > "$service_file" << EOF
 [Unit]
 Description=Clipboard sync between Linux and macOS
@@ -115,9 +120,11 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=$PREFIX/bin/clipboard-sync
-Restart=always
+Restart=on-failure
 RestartSec=10
-Environment=DISPLAY=:0
+Environment=DISPLAY=$display
+Environment=WAYLAND_DISPLAY=$wayland_display
+Environment=XDG_RUNTIME_DIR=$xdg_runtime_dir
 
 [Install]
 WantedBy=default.target

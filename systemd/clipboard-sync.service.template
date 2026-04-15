@@ -5,9 +5,11 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={{INSTALL_PREFIX}}/bin/clipboard-sync
-Restart=always
+Restart=on-failure
 RestartSec=10
 Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]
 WantedBy=default.target
