@@ -287,6 +287,7 @@ pull_text_from_macos() {
 }
 
 pull_image_from_macos() {
+    echo "[DEBUG] pull_image_from_macos: starting" >&2
     local tmp="$TEMP_DIR/macos_image_$$.png"
     local mac_path
 
@@ -294,18 +295,23 @@ pull_image_from_macos() {
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         local socket
         socket=$(get_ssh_socket)
+        echo "[DEBUG] pull_image_from_macos: using mux socket, running imagecopy on remote" >&2
         mac_path=$(ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
             "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
     else
+        echo "[DEBUG] pull_image_from_macos: using direct ssh, running imagecopy on remote" >&2
         mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
             "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
     fi
+    echo "[DEBUG] pull_image_from_macos: imagecopy returned mac_path='$mac_path'" >&2
 
     # Validate returned path
     if [[ -z "$mac_path" ]] || [[ "$mac_path" == *\** ]] || [[ "$mac_path" != /tmp/* ]]; then
+        echo "[DEBUG] pull_image_from_macos: invalid mac_path, returning early" >&2
         return 1
     fi
 
+    echo "[DEBUG] pull_image_from_macos: scp copying from remote to $tmp" >&2
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         local socket
         socket=$(get_ssh_socket)
@@ -315,10 +321,13 @@ pull_image_from_macos() {
         scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
         ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
     fi
+    echo "[DEBUG] pull_image_from_macos: scp done" >&2
 
     if [[ -s "$tmp" ]]; then
+        echo "[DEBUG] pull_image_from_macos: returning $tmp" >&2
         echo "$tmp"
     else
+        echo "[DEBUG] pull_image_from_macos: empty file, returning failure" >&2
         rm -f "$tmp"
         return 1
     fi
@@ -474,7 +483,7 @@ poll_macos_image() {
     fi
     
     local tmp_mac_img
-    tmp_mac_img=$(pull_image_from_macos) || return
+    tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
 
     if [[ ! -f "$tmp_mac_img" ]]; then
         return
