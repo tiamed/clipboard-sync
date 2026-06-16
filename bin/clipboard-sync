@@ -21,6 +21,7 @@ declare -g ENABLE_IMAGE="true"
 declare -g USE_WAYLAND_WATCH="true"
 declare -g MACOS_EVENT_MODE="polling"
 declare -g MACOS_EVENT_FIFO="/tmp/clipboard-sync.fifo"
+declare -g MACOS_IMAGE_CHECK_INTERVAL="5"
 declare -g NOTIFICATIONS_ENABLED="true"
 declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5"
 declare -g SSH_MUX_ENABLED="true"
@@ -32,18 +33,24 @@ readonly CONFIG_FILE="$HOME/.config/clipboard-sync/config.ini"
 readonly STATE_DIR="$HOME/.local/state/clipboard-sync"
 readonly STATE_TEXT_HASH="$STATE_DIR/text_hash"
 readonly STATE_IMAGE_HASH="$STATE_DIR/image_hash"
+readonly STATE_MACOS_CHANGE_COUNT="$STATE_DIR/macos_change_count"
 readonly TEMP_DIR="/tmp/clipboard_sync_$$"
 readonly SSH_MUX_DIR="$HOME/.cache/clipboard-sync/ssh-mux"
 
 # === STATE ===
 LAST_TEXT_HASH=""
 LAST_IMAGE_HASH=""
+LAST_MACOS_CHANGE_COUNT=""
+MACOS_IMAGE_CHANGE_COUNT_SUPPORTED=""
+MACOS_IMAGE_NEXT_CHANGE_CHECK=0
+MACOS_IMAGE_NEXT_POLL=0
 TEXT_WATCH_PID=""
 TEXT_WATCH_FD=""
 IMG_WATCH_PID=""
 IMG_WATCH_FD=""
 MACOS_FIFO_PID=""
 MACOS_FIFO_FD=""
+CLEANUP_DONE="false"
 
 # === INI PARSER ===
 parse_config() {
@@ -94,6 +101,7 @@ parse_config() {
                         use_wayland_watch) USE_WAYLAND_WATCH="$value" ;;
                         macos_event_mode) MACOS_EVENT_MODE="$value" ;;
                         macos_event_fifo) MACOS_EVENT_FIFO="$value" ;;
+                        macos_image_check_interval) MACOS_IMAGE_CHECK_INTERVAL="$value" ;;
                     esac
                     ;;
                 notifications)
@@ -153,6 +161,7 @@ setup() {
     touch "$STATE_TEXT_HASH" "$STATE_IMAGE_HASH"
     LAST_TEXT_HASH=$(cat "$STATE_TEXT_HASH" 2>/dev/null || echo "")
     LAST_IMAGE_HASH=$(cat "$STATE_IMAGE_HASH" 2>/dev/null || echo "")
+    LAST_MACOS_CHANGE_COUNT=$(cat "$STATE_MACOS_CHANGE_COUNT" 2>/dev/null || echo "")
 }
 
 # Get SSH socket path for current connection
@@ -205,6 +214,11 @@ ensure_ssh_master() {
 }
 
 cleanup() {
+    if [[ "$CLEANUP_DONE" == "true" ]]; then
+        return
+    fi
+    CLEANUP_DONE="true"
+
     rm -rf "$TEMP_DIR" 2>/dev/null || true
 
     stop_wayland_watchers
@@ -218,6 +232,11 @@ cleanup() {
             ssh -O exit -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null || true
         fi
     fi
+}
+
+handle_shutdown() {
+    cleanup
+    exit 0
 }
 
 # === UTILITIES ===
@@ -238,6 +257,54 @@ get_file_hash() {
     sha256sum "$1" | awk '{print $1}'
 }
 
+# Get a stable hash of image pixels. Clipboard APIs may re-encode PNG bytes
+# without changing the visible image, so byte hashes are not stable enough.
+get_image_hash() {
+    local file="$1"
+    local hash=""
+
+    if command -v python3 >/dev/null 2>&1; then
+        hash=$(python3 - "$file" <<'PY' 2>/dev/null || true
+import hashlib
+import sys
+
+try:
+    from PIL import Image, ImageOps
+
+    path = sys.argv[1]
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGBA")
+        digest = hashlib.sha256()
+        digest.update(b"img-v1\0")
+        digest.update(str(img.size[0]).encode("ascii"))
+        digest.update(b"x")
+        digest.update(str(img.size[1]).encode("ascii"))
+        digest.update(b"\0RGBA\0")
+        digest.update(img.tobytes())
+        print(digest.hexdigest())
+except Exception:
+    sys.exit(1)
+PY
+)
+        if [[ -n "$hash" ]]; then
+            echo "$hash"
+            return 0
+        fi
+    fi
+
+    if command -v magick >/dev/null 2>&1; then
+        hash=$(magick "$file" -auto-orient -alpha on rgba:- 2>/dev/null | sha256sum | awk '{print $1}') || hash=""
+        if [[ -n "$hash" ]]; then
+            local geometry
+            geometry=$(magick identify -format '%w:%h' "$file" 2>/dev/null || echo "")
+            echo "magick:${geometry}:${hash}"
+            return 0
+        fi
+    fi
+
+    get_file_hash "$file"
+}
+
 # Escape notification content for notify-send
 escape_notification() {
     local text="$1"
@@ -256,6 +323,11 @@ log() {
 log_info()  { log "INFO" "$@"; }
 log_warn()  { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
+log_debug() {
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        log "DEBUG" "$@"
+    fi
+}
 
 # Check SSH connection health
 check_connection() {
@@ -314,7 +386,6 @@ pull_text_from_macos() {
 }
 
 pull_image_from_macos() {
-    echo "[DEBUG] pull_image_from_macos: starting" >&2
     local tmp="$TEMP_DIR/macos_image_$$.png"
     local mac_path
 
@@ -322,23 +393,20 @@ pull_image_from_macos() {
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         local socket
         socket=$(get_ssh_socket)
-        echo "[DEBUG] pull_image_from_macos: using mux socket, running imagecopy on remote" >&2
+        log_debug "pull_image_from_macos: using mux socket"
         mac_path=$(ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
             "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
     else
-        echo "[DEBUG] pull_image_from_macos: using direct ssh, running imagecopy on remote" >&2
+        log_debug "pull_image_from_macos: using direct ssh"
         mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
             "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
     fi
-    echo "[DEBUG] pull_image_from_macos: imagecopy returned mac_path='$mac_path'" >&2
 
     # Validate returned path
     if [[ -z "$mac_path" ]] || [[ "$mac_path" == *\** ]] || [[ "$mac_path" != /tmp/* ]]; then
-        echo "[DEBUG] pull_image_from_macos: invalid mac_path, returning early" >&2
         return 1
     fi
 
-    echo "[DEBUG] pull_image_from_macos: scp copying from remote to $tmp" >&2
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         local socket
         socket=$(get_ssh_socket)
@@ -348,15 +416,30 @@ pull_image_from_macos() {
         scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
         ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
     fi
-    echo "[DEBUG] pull_image_from_macos: scp done" >&2
 
     if [[ -s "$tmp" ]]; then
-        echo "[DEBUG] pull_image_from_macos: returning $tmp" >&2
         echo "$tmp"
     else
-        echo "[DEBUG] pull_image_from_macos: empty file, returning failure" >&2
         rm -f "$tmp"
         return 1
+    fi
+}
+
+get_macos_change_count() {
+    if [[ -z "$MACOS_IMAGE_COPY_PATH" ]]; then
+        return 1
+    fi
+
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH --change-count 2>/dev/null || osascript -l JavaScript -e 'ObjC.import(\"AppKit\"); \$.NSPasteboard.generalPasteboard.changeCount'" 2>/dev/null |
+            awk '/^[0-9]+$/ { count = $0 } END { if (count != "") print count; else exit 1 }'
+    else
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+            "$MACOS_IMAGE_COPY_PATH --change-count 2>/dev/null || osascript -l JavaScript -e 'ObjC.import(\"AppKit\"); \$.NSPasteboard.generalPasteboard.changeCount'" 2>/dev/null |
+            awk '/^[0-9]+$/ { count = $0 } END { if (count != "") print count; else exit 1 }'
     fi
 }
 
@@ -462,7 +545,7 @@ poll_linux_image() {
     fi
 
     local current_hash
-    current_hash=$(get_file_hash "$tmp_img")
+    current_hash=$(get_image_hash "$tmp_img")
 
     if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
         if check_connection && push_image_to_macos "$tmp_img"; then
@@ -508,16 +591,51 @@ poll_macos_image() {
     if [[ "$ENABLE_IMAGE" != "true" ]]; then
         return
     fi
+
+    local now
+    now=$(date +%s)
+
+    local macos_change_count=""
+    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" != "false" ]]; then
+        if [[ "$now" -lt "$MACOS_IMAGE_NEXT_CHANGE_CHECK" ]]; then
+            return
+        fi
+        MACOS_IMAGE_NEXT_CHANGE_CHECK=$((now + MACOS_IMAGE_CHECK_INTERVAL))
+
+        macos_change_count=$(get_macos_change_count) || macos_change_count=""
+        if [[ "$macos_change_count" =~ ^[0-9]+$ ]]; then
+            MACOS_IMAGE_CHANGE_COUNT_SUPPORTED="true"
+            if [[ "$macos_change_count" == "$LAST_MACOS_CHANGE_COUNT" ]]; then
+                return
+            fi
+        else
+            if [[ -z "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" ]]; then
+                log_warn "macOS image helper lacks --change-count; throttling fallback image polling"
+            fi
+            MACOS_IMAGE_CHANGE_COUNT_SUPPORTED="false"
+        fi
+    fi
+
+    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "false" ]]; then
+        if [[ "$now" -lt "$MACOS_IMAGE_NEXT_POLL" ]]; then
+            return
+        fi
+        MACOS_IMAGE_NEXT_POLL=$((now + 10))
+    fi
     
     local tmp_mac_img
     tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
 
     if [[ ! -f "$tmp_mac_img" ]]; then
+        if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "true" ]]; then
+            LAST_MACOS_CHANGE_COUNT="$macos_change_count"
+            echo "$LAST_MACOS_CHANGE_COUNT" > "$STATE_MACOS_CHANGE_COUNT"
+        fi
         return
     fi
 
     local current_hash
-    current_hash=$(get_file_hash "$tmp_mac_img")
+    current_hash=$(get_image_hash "$tmp_mac_img")
 
     if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
         if wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
@@ -526,6 +644,11 @@ poll_macos_image() {
             echo "[$(date '+%H:%M:%S')] Image pulled from macOS"
             notify_linux "Clipboard Sync [IMAGE]" "Image copied"
         fi
+    fi
+
+    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "true" ]]; then
+        LAST_MACOS_CHANGE_COUNT="$macos_change_count"
+        echo "$LAST_MACOS_CHANGE_COUNT" > "$STATE_MACOS_CHANGE_COUNT"
     fi
 
     rm -f "$tmp_mac_img"
@@ -932,7 +1055,8 @@ main() {
             ;;
         "")
             # Daemon mode (default, backward compatible)
-            trap cleanup EXIT INT TERM
+            trap cleanup EXIT
+            trap handle_shutdown INT TERM
             validate_config || exit 1
             run_daemon
             ;;

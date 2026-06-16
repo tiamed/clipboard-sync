@@ -206,6 +206,7 @@ while the configured `poll_interval` still acts as a safety net.
 | `[sync]` | `use_wayland_watch` | `true` | Use `wl-paste --watch` event monitoring when available |
 | `[sync]` | `macos_event_mode` | `polling` | macOS → Linux mode: `polling` or `fifo` |
 | `[sync]` | `macos_event_fifo` | `/tmp/clipboard-sync.fifo` | Path to the FIFO created by the macOS daemon |
+| `[sync]` | `macos_image_check_interval` | `5` | Seconds between lightweight macOS image change checks in polling mode |
 | `[notifications]` | `enabled` | `true` | Show desktop notifications |
 | `[ssh]` | `options` | (see example) | SSH connection options |
 

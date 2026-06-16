@@ -22,6 +22,8 @@ use_wayland_watch = true
 macos_event_mode = polling
 # Path to the FIFO created by the macOS daemon (only used when macos_event_mode = fifo)
 macos_event_fifo = /tmp/clipboard-sync.fifo
+# Seconds between lightweight macOS image change checks in polling mode
+macos_image_check_interval = 5
 
 [notifications]
 # Show notifications when clipboard syncs

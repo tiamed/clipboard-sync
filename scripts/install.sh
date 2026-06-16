@@ -123,6 +123,7 @@ min_length = 1
 poll_interval = 1
 enable_text = true
 enable_image = true
+macos_image_check_interval = 5
 
 [notifications]
 enabled = true
