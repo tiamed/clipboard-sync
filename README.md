@@ -150,6 +150,48 @@ chmod +x ~/scripts/imagecopy
 ~/scripts/imagecopy -o /path/to/output.png # Save clipboard image to file
 ```
 
+## Event-Driven Monitoring
+
+By default the daemon tries to use native clipboard event APIs instead of
+polling when it can:
+
+- **Linux (Wayland)**: uses `wl-paste --watch` for both text and image changes.
+  If your `wl-paste` does not support `--watch` (e.g. `wl-clipboard-rs`) or the
+  compositor lacks the data-control protocol, the daemon automatically falls back
+  to polling.
+- **macOS**: install the optional `clipboard-sync-daemon` on your Mac to push
+  changes to the Linux side through a FIFO or Unix domain socket instead of
+  polling via SSH.
+
+### macOS daemon (optional)
+
+Build and install on macOS:
+
+```bash
+swiftc macos/clipboard-sync-daemon.swift -o ~/scripts/clipboard-sync-daemon
+chmod +x ~/scripts/clipboard-sync-daemon
+```
+
+Load with `launchd`:
+
+```bash
+cp macos/clipboard-sync-daemon.plist.template \
+   ~/Library/LaunchAgents/clipboard-sync.daemon.plist
+# Edit the plist to match your install prefix, then:
+launchctl load -w ~/Library/LaunchAgents/clipboard-sync.daemon.plist
+```
+
+On the Linux side, enable FIFO mode in `config.ini`:
+
+```ini
+[sync]
+macos_event_mode = fifo
+macos_event_fifo = /tmp/clipboard-sync.fifo
+```
+
+When the FIFO reader is active, macOS clipboard changes are pulled immediately
+while the configured `poll_interval` still acts as a safety net.
+
 ## Configuration Reference
 
 | Section | Option | Default | Description |
@@ -158,9 +200,12 @@ chmod +x ~/scripts/imagecopy
 | `[remote]` | `host` | (required) | macOS hostname/IP |
 | `[remote]` | `image_copy_path` | (required) | Path to imagecopy helper |
 | `[sync]` | `min_length` | `1` | Minimum text length to sync |
-| `[sync]` | `poll_interval` | `1` | Seconds between polls |
+| `[sync]` | `poll_interval` | `1` | Seconds between polls (also safety-net interval for macOS polling in event mode) |
 | `[sync]` | `enable_text` | `true` | Enable text sync |
 | `[sync]` | `enable_image` | `true` | Enable image sync |
+| `[sync]` | `use_wayland_watch` | `true` | Use `wl-paste --watch` event monitoring when available |
+| `[sync]` | `macos_event_mode` | `polling` | macOS → Linux mode: `polling` or `fifo` |
+| `[sync]` | `macos_event_fifo` | `/tmp/clipboard-sync.fifo` | Path to the FIFO created by the macOS daemon |
 | `[notifications]` | `enabled` | `true` | Show desktop notifications |
 | `[ssh]` | `options` | (see example) | SSH connection options |
 
@@ -204,7 +249,7 @@ journalctl --user -u clipboard-sync -f
 ### Continuous Daemon
 
 ```bash
-# Run without arguments for continuous polling (default)
+# Run without arguments for continuous sync (event-driven when available)
 ~/.local/bin/clipboard-sync
 ```
 
@@ -270,6 +315,26 @@ journalctl --user -u clipboard-sync -f
    ```bash
    echo $WAYLAND_DISPLAY
    ```
+
+3. If using `wl-clipboard-rs` (doesn't support `--watch`):
+   - Install the original `wl-clipboard` package for event-driven monitoring
+   - Or let the daemon fall back to polling mode automatically
+
+### Event monitoring issues
+
+1. **"wl-paste does not support --watch"**: Install the original `wl-clipboard` package. The `wl-clipboard-rs` variant doesn't support `--watch`, so the daemon automatically falls back to polling.
+
+2. **"Wayland watcher died, restarting..."**: Check logs for the underlying error:
+   ```bash
+   journalctl --user -u clipboard-sync -n 100
+   ```
+
+3. **"macOS FIFO reader failed to start"**: 
+   - Verify SSH connection works: `ssh your_mac_user@your_mac_host "echo OK"`
+   - Check that the macOS daemon is running: `ssh your_mac_user@your_mac_host "launchctl list | grep clipboard-sync"`
+   - Verify FIFO path matches in both config.ini and the macOS daemon plist
+
+4. **High CPU usage**: If using polling mode and CPU usage is high, increase `poll_interval` in config.ini to 2 or 3 seconds.
 
 ## License
 

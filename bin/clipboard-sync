@@ -18,6 +18,9 @@ declare -g MIN_LENGTH="1"
 declare -g POLL_INTERVAL="1"
 declare -g ENABLE_TEXT="true"
 declare -g ENABLE_IMAGE="true"
+declare -g USE_WAYLAND_WATCH="true"
+declare -g MACOS_EVENT_MODE="polling"
+declare -g MACOS_EVENT_FIFO="/tmp/clipboard-sync.fifo"
 declare -g NOTIFICATIONS_ENABLED="true"
 declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5"
 declare -g SSH_MUX_ENABLED="true"
@@ -35,6 +38,12 @@ readonly SSH_MUX_DIR="$HOME/.cache/clipboard-sync/ssh-mux"
 # === STATE ===
 LAST_TEXT_HASH=""
 LAST_IMAGE_HASH=""
+TEXT_WATCH_PID=""
+TEXT_WATCH_FD=""
+IMG_WATCH_PID=""
+IMG_WATCH_FD=""
+MACOS_FIFO_PID=""
+MACOS_FIFO_FD=""
 
 # === INI PARSER ===
 parse_config() {
@@ -82,6 +91,9 @@ parse_config() {
                         poll_interval) POLL_INTERVAL="$value" ;;
                         enable_text) ENABLE_TEXT="$value" ;;
                         enable_image) ENABLE_IMAGE="$value" ;;
+                        use_wayland_watch) USE_WAYLAND_WATCH="$value" ;;
+                        macos_event_mode) MACOS_EVENT_MODE="$value" ;;
+                        macos_event_fifo) MACOS_EVENT_FIFO="$value" ;;
                     esac
                     ;;
                 notifications)
@@ -194,7 +206,10 @@ ensure_ssh_master() {
 
 cleanup() {
     rm -rf "$TEMP_DIR" 2>/dev/null || true
-    
+
+    stop_wayland_watchers
+    stop_macos_fifo_reader
+
     # Close SSH master connection if we started it
     if [[ "$SSH_MUX_ENABLED" == "true" ]] && [[ -n "${REMOTE_USER:-}" ]] && [[ -n "${REMOTE_HOST:-}" ]]; then
         local socket
@@ -229,6 +244,18 @@ escape_notification() {
     # Prepend space to prevent leading dash interpretation
     echo " $text" | sed 's/%/%%/g; s/\\/\\\\/g; s/"/\\"/g'
 }
+
+# === LOGGING ===
+# All output goes to stderr so systemd/journalctl captures it.
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+}
+
+log_info()  { log "INFO" "$@"; }
+log_warn()  { log "WARN" "$@"; }
+log_error() { log "ERROR" "$@"; }
 
 # Check SSH connection health
 check_connection() {
@@ -504,6 +531,190 @@ poll_macos_image() {
     rm -f "$tmp_mac_img"
 }
 
+# === WAYLAND EVENT WATCHERS ===
+
+wl_paste_watch_supported() {
+    command -v wl-paste >/dev/null 2>&1 || return 1
+    wl-paste --help 2>&1 | grep -q -- '--watch'
+}
+
+wayland_watch_available() {
+    if [[ "$USE_WAYLAND_WATCH" != "true" ]]; then
+        return 1
+    fi
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+        log_warn "WAYLAND_DISPLAY not set, falling back to polling"
+        return 1
+    fi
+    if ! command -v wl-paste >/dev/null 2>&1; then
+        log_warn "wl-paste not found, falling back to polling"
+        return 1
+    fi
+    if ! wl_paste_watch_supported; then
+        log_warn "wl-paste does not support --watch, falling back to polling"
+        return 1
+    fi
+    return 0
+}
+
+start_wayland_watchers() {
+    # Use differently-named variables for the coprocess because bash unsets the
+    # special coproc PID variable once the child is reaped.
+    coproc _TEXT_WATCH { exec wl-paste --type text --watch printf 'TEXT_CHANGED\n'; }
+    TEXT_WATCH_PID=${_TEXT_WATCH_PID:-}
+    TEXT_WATCH_FD=${_TEXT_WATCH[0]:-}
+
+    coproc _IMG_WATCH { exec wl-paste --type image/png --watch printf 'IMG_CHANGED\n'; }
+    IMG_WATCH_PID=${_IMG_WATCH_PID:-}
+    IMG_WATCH_FD=${_IMG_WATCH[0]:-}
+
+    sleep 0.2
+    if [[ -z "$TEXT_WATCH_PID" ]] || [[ -z "$IMG_WATCH_PID" ]] || \
+       ! kill -0 "$TEXT_WATCH_PID" 2>/dev/null || ! kill -0 "$IMG_WATCH_PID" 2>/dev/null; then
+        log_error "wl-paste watcher(s) failed to start"
+        stop_wayland_watchers
+        return 1
+    fi
+    log_info "Wayland event watchers started (text=$TEXT_WATCH_PID image=$IMG_WATCH_PID)"
+    return 0
+}
+
+stop_wayland_watchers() {
+    local pid
+    for pid in "$TEXT_WATCH_PID" "$IMG_WATCH_PID"; do
+        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 0.2
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    TEXT_WATCH_PID=""
+    IMG_WATCH_PID=""
+}
+
+run_watch_loop() {
+    local last_watchdog last_macos_poll now
+    last_watchdog=$(date +%s)
+    last_macos_poll=$(date +%s)
+
+    while true; do
+        local changed=false event=""
+
+        # Drain all available text events
+        while read -r -t 0 -u "$TEXT_WATCH_FD" _ 2>/dev/null; do
+            read -r -u "$TEXT_WATCH_FD" event
+            if [[ "$event" == "TEXT_CHANGED" ]]; then
+                poll_linux_text
+                changed=true
+            fi
+        done
+
+        # Drain all available image events
+        while read -r -t 0 -u "$IMG_WATCH_FD" _ 2>/dev/null; do
+            read -r -u "$IMG_WATCH_FD" event
+            if [[ "$event" == "IMG_CHANGED" ]]; then
+                poll_linux_image
+                changed=true
+            fi
+        done
+
+        # Drain all available macOS FIFO events
+        if [[ -n "$MACOS_FIFO_FD" ]]; then
+            while read -r -t 0 -u "$MACOS_FIFO_FD" _ 2>/dev/null; do
+                read -r -u "$MACOS_FIFO_FD" event
+                handle_macos_fifo_event
+                changed=true
+            done
+        fi
+
+        # Poll macOS clipboard on the configured interval as a safety net.
+        now=$(date +%s)
+        if [[ $((now - last_macos_poll)) -ge $POLL_INTERVAL ]]; then
+            poll_macos_text
+            poll_macos_image
+            last_macos_poll=$now
+        fi
+
+        # Watchdog: check watcher health every 5s using elapsed time.
+        if [[ $((now - last_watchdog)) -ge 5 ]]; then
+            if ! kill -0 "$TEXT_WATCH_PID" 2>/dev/null || ! kill -0 "$IMG_WATCH_PID" 2>/dev/null; then
+                log_warn "Wayland watcher died, restarting..."
+                stop_wayland_watchers
+                if ! start_wayland_watchers; then
+                    log_warn "Wayland watcher restart failed, falling back to polling"
+                    return 1
+                fi
+            fi
+            if [[ -n "$MACOS_FIFO_PID" ]] && ! kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
+                log_warn "macOS FIFO reader died, restarting..."
+                stop_macos_fifo_reader
+                start_macos_fifo_reader || true
+            fi
+            last_watchdog=$now
+        fi
+
+        if ! $changed; then
+            sleep 0.2
+        fi
+    done
+}
+
+run_polling_loop() {
+    while true; do
+        poll_linux_text
+        poll_linux_image
+        poll_macos_text
+        poll_macos_image
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# === MACOS FIFO EVENT READER (optional) ===
+
+macos_fifo_available() {
+    if [[ "$MACOS_EVENT_MODE" != "fifo" ]]; then
+        return 1
+    fi
+    if [[ -z "$MACOS_EVENT_FIFO" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+start_macos_fifo_reader() {
+    coproc _MACOS_FIFO { exec ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "cat '$MACOS_EVENT_FIFO'"; }
+    MACOS_FIFO_PID=${_MACOS_FIFO_PID:-}
+    MACOS_FIFO_FD=${_MACOS_FIFO[0]:-}
+
+    sleep 0.2
+    if [[ -z "$MACOS_FIFO_PID" ]] || ! kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
+        log_warn "macOS FIFO reader failed to start"
+        stop_macos_fifo_reader
+        return 1
+    fi
+    log_info "macOS FIFO reader started (pid $MACOS_FIFO_PID)"
+    return 0
+}
+
+stop_macos_fifo_reader() {
+    if [[ -n "${MACOS_FIFO_PID:-}" ]] && kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
+        kill "$MACOS_FIFO_PID" 2>/dev/null || true
+        sleep 0.2
+        kill -0 "$MACOS_FIFO_PID" 2>/dev/null && kill -9 "$MACOS_FIFO_PID" 2>/dev/null || true
+        wait "$MACOS_FIFO_PID" 2>/dev/null || true
+    fi
+    MACOS_FIFO_PID=""
+}
+
+handle_macos_fifo_event() {
+    # The daemon sends the actual content, but for now we use the event purely
+    # as a trigger to pull the latest clipboard from macOS via SSH. A future
+    # optimization could decode the embedded content and skip the SSH round-trip.
+    poll_macos_text
+    poll_macos_image
+}
+
 # === ONE-SHOT COMMANDS ===
 
 cmd_sync_to() {
@@ -667,26 +878,31 @@ run_daemon() {
         fi
     fi
 
-    echo "Clipboard sync started (Linux ←→ macOS)"
-    echo "Remote: $REMOTE_USER@$REMOTE_HOST"
-    echo "Config: $CONFIG_FILE"
-    echo "State: $STATE_DIR"
-    echo "Text sync: $ENABLE_TEXT"
-    echo "Image sync: $ENABLE_IMAGE"
-    echo "Polling interval: ${POLL_INTERVAL}s"
-    echo "Monitoring..."
+    log_info "Clipboard sync started (Linux ←→ macOS)"
+    log_info "Remote: $REMOTE_USER@$REMOTE_HOST"
+    log_info "Config: $CONFIG_FILE"
+    log_info "State: $STATE_DIR"
+    log_info "Text sync: $ENABLE_TEXT"
+    log_info "Image sync: $ENABLE_IMAGE"
+    log_info "Polling interval: ${POLL_INTERVAL}s"
 
-    while true; do
-        # Linux → macOS
-        poll_linux_text
-        poll_linux_image
+    local use_watch=false
+    if wayland_watch_available && start_wayland_watchers; then
+        use_watch=true
+        log_info "Using Wayland event-driven monitoring"
+    else
+        log_info "Using polling mode for Linux clipboard"
+    fi
 
-        # macOS → Linux
-        poll_macos_text
-        poll_macos_image
+    if macos_fifo_available && start_macos_fifo_reader; then
+        log_info "Using macOS FIFO event-driven monitoring"
+    fi
 
-        sleep "$POLL_INTERVAL"
-    done
+    if $use_watch; then
+        run_watch_loop || run_polling_loop
+    else
+        run_polling_loop
+    fi
 }
 
 main() {
@@ -728,4 +944,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

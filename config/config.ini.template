@@ -11,11 +11,17 @@ image_copy_path = /Users/YOUR_MAC_USERNAME/scripts/imagecopy
 [sync]
 # Minimum text length to sync (avoid syncing tiny snippets)
 min_length = 1
-# Polling interval in seconds
+# Polling interval in seconds (also used for macOS polling in event mode)
 poll_interval = 1
 # Enable/disable sync types
 enable_text = true
 enable_image = true
+# Use event-driven Wayland clipboard monitoring when available
+use_wayland_watch = true
+# macOS → Linux event mode: polling (default) or fifo
+macos_event_mode = polling
+# Path to the FIFO created by the macOS daemon (only used when macos_event_mode = fifo)
+macos_event_fifo = /tmp/clipboard-sync.fifo
 
 [notifications]
 # Show notifications when clipboard syncs
