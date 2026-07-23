@@ -501,7 +501,8 @@ poll_linux_text() {
     fi
     
     local linux_text
-    linux_text=$(wl-paste -t text/plain 2>/dev/null || echo "")
+    # timeout: wl-paste blocks forever on Wayland when no selection owner exists
+    linux_text=$(timeout 2 wl-paste -t text/plain 2>/dev/null || echo "")
 
     if [[ ${#linux_text} -lt $MIN_LENGTH ]]; then
         return
@@ -527,14 +528,14 @@ poll_linux_image() {
     fi
     
     local image_type
-    image_type=$(wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
+    image_type=$(timeout 2 wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
 
     if [[ -z "$image_type" ]]; then
         return
     fi
 
     local tmp_img="$TEMP_DIR/linux_image_$$.${image_type#image/}"
-    if ! wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null; then
+    if ! timeout 2 wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null; then
         rm -f "$tmp_img"
         return
     fi
@@ -578,7 +579,7 @@ poll_macos_text() {
     current_hash=$(get_text_hash "$mac_text")
 
     if [[ "$current_hash" != "$LAST_TEXT_HASH" ]]; then
-        if printf '%s' "$mac_text" | wl-copy -t text/plain 2>/dev/null; then
+        if printf '%s' "$mac_text" | timeout 2 wl-copy -t text/plain 2>/dev/null; then
             LAST_TEXT_HASH="$current_hash"
             echo "$LAST_TEXT_HASH" > "$STATE_TEXT_HASH"
             echo "[$(date '+%H:%M:%S')] Text pulled from macOS"
@@ -638,7 +639,7 @@ poll_macos_image() {
     current_hash=$(get_image_hash "$tmp_mac_img")
 
     if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
-        if wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
+        if timeout 2 wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
             LAST_IMAGE_HASH="$current_hash"
             echo "$LAST_IMAGE_HASH" > "$STATE_IMAGE_HASH"
             echo "[$(date '+%H:%M:%S')] Image pulled from macOS"
@@ -858,11 +859,11 @@ cmd_sync_to() {
     # Try image first
     if [[ "$ENABLE_IMAGE" == "true" ]]; then
         local image_type
-        image_type=$(wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
+        image_type=$(timeout 2 wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
 
         if [[ -n "$image_type" ]]; then
             local tmp_img="$TEMP_DIR/sync_to_image_$$.${image_type#image/}"
-            if wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null && [[ -s "$tmp_img" ]]; then
+            if timeout 2 wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null && [[ -s "$tmp_img" ]]; then
                 if push_image_to_macos "$tmp_img"; then
                     rm -f "$tmp_img"
                     notify_macos "Clipboard Sync" "Image received from Linux"
@@ -881,7 +882,7 @@ cmd_sync_to() {
     # Fall back to text
     if [[ "$ENABLE_TEXT" == "true" ]]; then
         local linux_text
-        linux_text=$(wl-paste -t text/plain 2>/dev/null || echo "")
+        linux_text=$(timeout 2 wl-paste -t text/plain 2>/dev/null || echo "")
 
         if [[ ${#linux_text} -ge $MIN_LENGTH ]]; then
             linux_text=$(ensure_utf8 "$linux_text")
@@ -921,7 +922,7 @@ cmd_sync_from() {
         tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
 
         if [[ -n "$tmp_mac_img" ]] && [[ -f "$tmp_mac_img" ]]; then
-            if wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
+            if timeout 2 wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
                 rm -f "$tmp_mac_img"
                 notify_linux "Clipboard Sync [IMAGE]" "Image copied"
                 echo "Image synced from macOS"
@@ -942,7 +943,7 @@ cmd_sync_from() {
 
         if [[ ${#mac_text} -ge $MIN_LENGTH ]]; then
             mac_text=$(ensure_utf8 "$mac_text")
-            if printf '%s' "$mac_text" | wl-copy -t text/plain 2>/dev/null; then
+            if printf '%s' "$mac_text" | timeout 2 wl-copy -t text/plain 2>/dev/null; then
                 notify_linux "Clipboard Sync" "$mac_text"
                 echo "Text synced from macOS (${#mac_text} chars)"
                 return 0

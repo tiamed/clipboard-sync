@@ -26,3 +26,6 @@ config/config.ini
 # Test artifacts
 test/tmp/
 test/output/
+
+# coding agents
+.omo/
