@@ -17,44 +17,50 @@ jobs:
         arch: [x86_64, arm64]
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Build imagecopy for ${{ matrix.arch }}
+
+      - name: Build helpers for ${{ matrix.arch }}
         run: |
           if [ "${{ matrix.arch }}" = "arm64" ]; then
-            swiftc -target arm64-apple-macosx11.0 macos/imagecopy.swift -o imagecopy-arm64
+            TARGET=arm64-apple-macosx11.0
           else
-            swiftc -target x86_64-apple-macosx11.0 macos/imagecopy.swift -o imagecopy-x86_64
+            TARGET=x86_64-apple-macosx11.0
           fi
-      
+          swiftc -target "$TARGET" macos/imagecopy.swift -o "imagecopy-${{ matrix.arch }}"
+          swiftc -target "$TARGET" macos/clipboard-sync-daemon.swift -o "clipboard-sync-daemon-${{ matrix.arch }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: imagecopy-${{ matrix.arch }}
-          path: imagecopy-*
+          name: macos-${{ matrix.arch }}
+          path: |
+            imagecopy-${{ matrix.arch }}
+            clipboard-sync-daemon-${{ matrix.arch }}
 
   release:
     needs: build-macos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      
+
       - name: Create release assets
         run: |
           mkdir -p release
-          mv artifacts/imagecopy-arm64/imagecopy-arm64 release/
-          mv artifacts/imagecopy-x86_64/imagecopy-x86_64 release/
+          mv artifacts/macos-arm64/imagecopy-arm64 release/
+          mv artifacts/macos-arm64/clipboard-sync-daemon-arm64 release/
+          mv artifacts/macos-x86_64/imagecopy-x86_64 release/
+          mv artifacts/macos-x86_64/clipboard-sync-daemon-x86_64 release/
           chmod +x release/*
-          
+
       - name: Create SHA256 checksums
         run: |
           cd release
           sha256sum * > checksums.txt
-      
+
       - name: Get version
         id: version
         run: |
@@ -63,7 +69,7 @@ jobs:
           else
             echo "VERSION=v0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           fi
-      
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -71,32 +77,18 @@ jobs:
           name: Clipboard Sync ${{ steps.version.outputs.VERSION }}
           files: release/*
           body: |
-            ## Installation
-            
+            ## Push architecture
+
+            Near-instant bidirectional sync: Wayland watch + macOS FIFO push over SSH ControlMaster.
+
             ### Linux
-            
             ```bash
-            git clone https://github.com/tiamed/clipboard-sync.git
-            cd clipboard-sync
-            ./scripts/install.sh
+            curl -sSL https://tiamed.github.io/clipboard-sync/install-linux.sh | bash
             ```
-            
-            ### macOS (imagecopy helper)
-            
+
+            ### macOS (daemon + imagecopy — required for push)
             ```bash
             curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
-            ```
-            
-            Or manually:
-            ```bash
-            # Download the binary for your architecture
-            # arm64 (M1/M2/M3 Macs)
-            curl -Lo ~/scripts/imagecopy https://github.com/tiamed/clipboard-sync/releases/download/${{ steps.version.outputs.VERSION }}/imagecopy-arm64
-            
-            # x86_64 (Intel Macs)
-            curl -Lo ~/scripts/imagecopy https://github.com/tiamed/clipboard-sync/releases/download/${{ steps.version.outputs.VERSION }}/imagecopy-x86_64
-            
-            chmod +x ~/scripts/imagecopy
             ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
