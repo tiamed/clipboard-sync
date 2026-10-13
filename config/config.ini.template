@@ -1,40 +1,37 @@
 # Clipboard Sync Configuration
-# Copy this file to ~/.config/clipboard-sync/config.ini and edit as needed
+# Copy to ~/.config/clipboard-sync/config.ini and edit.
 
 [remote]
-# macOS remote connection settings
+# macOS SSH target
 user = YOUR_MAC_USERNAME
 host = YOUR_MAC_HOSTNAME_OR_IP
-# Path to imagecopy helper script on macOS (required for image sync)
+# Path to imagecopy helper on macOS (required for Linux → macOS images)
 image_copy_path = /Users/YOUR_MAC_USERNAME/scripts/imagecopy
 
 [sync]
-# Minimum text length to sync (avoid syncing tiny snippets)
+# Minimum text length to sync
 min_length = 1
-# Polling interval in seconds (also used for macOS polling in event mode)
-poll_interval = 1
-# Enable/disable sync types
+# Safety-net poll interval in seconds (push mode uses this rarely; poll mode uses it as primary)
+poll_interval = 30
 enable_text = true
 enable_image = true
-# Use event-driven Wayland clipboard monitoring when available
+# Use wl-paste --watch for Linux → macOS (falls back to polling if unavailable)
 use_wayland_watch = true
-# macOS → Linux event mode: polling (default) or fifo
-macos_event_mode = polling
-# Path to the FIFO created by the macOS daemon (only used when macos_event_mode = fifo)
+# macOS → Linux: fifo (push, recommended) or polling
+macos_event_mode = fifo
+# FIFO path must match clipboard-sync-daemon --fifo-path on the Mac
 macos_event_fifo = /tmp/clipboard-sync.fifo
-# Seconds between lightweight macOS image change checks in polling mode
+# PNG path written by the Mac daemon for IMGFILE events
+macos_push_image = /tmp/clipboard-sync-push.png
+# Only used when macos_event_mode = polling
 macos_image_check_interval = 5
 
 [notifications]
-# Show notifications when clipboard syncs
 enabled = true
 
 [ssh]
-# SSH connection options
-options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5
-# Enable SSH multiplexing (persistent connection) - reduces latency by 20-100x
-# After first connection, subsequent syncs are nearly instant
+options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+# Persistent ControlMaster — required for low-latency push
 mux_enabled = true
-# How long to keep the master connection alive after last use (seconds)
-# Recommended: 300 (5 min) for frequent sync, 60 for occasional
-mux_persist = 300
+# Keep master alive after last use (seconds)
+mux_persist = 600

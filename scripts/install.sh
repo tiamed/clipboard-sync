@@ -120,16 +120,21 @@ image_copy_path = /Users/YOUR_USERNAME/scripts/imagecopy
 
 [sync]
 min_length = 1
-poll_interval = 1
+poll_interval = 30
 enable_text = true
 enable_image = true
-macos_image_check_interval = 5
+use_wayland_watch = true
+macos_event_mode = fifo
+macos_event_fifo = /tmp/clipboard-sync.fifo
+macos_push_image = /tmp/clipboard-sync-push.png
 
 [notifications]
 enabled = true
 
 [ssh]
-options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5
+options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+mux_enabled = true
+mux_persist = 600
 EOF
             log_success "Created default config: $config_file"
             log_warn "You MUST edit $config_file before starting the service"

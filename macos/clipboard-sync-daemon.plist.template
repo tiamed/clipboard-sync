@@ -7,9 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>{{INSTALL_PREFIX}}/bin/clipboard-sync-daemon</string>
+        <string>{{INSTALL_PREFIX}}/clipboard-sync-daemon</string>
         <string>--fifo-path</string>
         <string>/tmp/clipboard-sync.fifo</string>
+        <string>--image-path</string>
+        <string>/tmp/clipboard-sync-push.png</string>
     </array>
 
     <key>RunAtLoad</key>

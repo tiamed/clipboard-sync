@@ -82,19 +82,22 @@ image_copy_path = /Users/YOUR_MAC_USERNAME/scripts/imagecopy
 
 [sync]
 min_length = 1
-poll_interval = 1
+# Safety-net interval; primary path is push (fifo + Wayland watch)
+poll_interval = 30
 enable_text = true
 enable_image = true
-macos_image_check_interval = 5
+use_wayland_watch = true
+macos_event_mode = fifo
+macos_event_fifo = /tmp/clipboard-sync.fifo
+macos_push_image = /tmp/clipboard-sync-push.png
 
 [notifications]
 enabled = true
 
 [ssh]
-options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5
-# SSH multiplexing - reduces latency by 20-100x
+options = -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
 mux_enabled = true
-mux_persist = 300
+mux_persist = 600
 EOF
         log_warn "Please edit $CONFIG_DIR/config.ini with your settings"
     else
@@ -145,9 +148,10 @@ print_summary() {
     echo "Installed to: $PREFIX"
     echo ""
     echo "Next steps:"
-    echo "  1. Edit $CONFIG_DIR/config.ini"
+    echo "  1. Edit $CONFIG_DIR/config.ini (remote.user / remote.host)"
     echo "  2. Ensure SSH key auth works to your Mac"
-    echo "  3. Run: systemctl --user enable --now clipboard-sync"
+    echo "  3. On Mac: curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash"
+    echo "  4. Run: systemctl --user enable --now clipboard-sync"
     echo ""
     echo "View logs:"
     echo "  journalctl --user -u clipboard-sync -f"

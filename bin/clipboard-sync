@@ -1,11 +1,17 @@
 #!/bin/bash
 #
-# clipboard-sync
-# Syncs clipboard bidirectionally between Linux (Wayland) and macOS
-# Requirements: wl-paste, wl-copy, ssh, scp, iconv, sha256sum
+# clipboard-sync — push-oriented bidirectional clipboard sync
+# Linux (Wayland) ↔ macOS over persistent SSH multiplexing.
 #
-# Configuration: ~/.config/clipboard-sync/config.ini
-# State: ~/.local/state/clipboard-sync/
+# Architecture (v2 push):
+#   • Outbound worker: wl-paste --watch → SSH push (never blocks inbound)
+#   • Inbound worker:  persistent SSH stream of Mac FIFO events with payload
+#                      (TEXT base64 applied locally; IMGFILE scp'd once)
+#   • Directions run in parallel; shared hashes + flock stop echo loops
+#   • Failures are logged (not swallowed); rare safety-net poll as fallback
+#
+# Config: ~/.config/clipboard-sync/config.ini
+# State:  ~/.local/state/clipboard-sync/
 #
 
 set -euo pipefail
@@ -15,75 +21,63 @@ declare -g REMOTE_USER=""
 declare -g REMOTE_HOST=""
 declare -g MACOS_IMAGE_COPY_PATH=""
 declare -g MIN_LENGTH="1"
-declare -g POLL_INTERVAL="1"
+declare -g POLL_INTERVAL="30"
 declare -g ENABLE_TEXT="true"
 declare -g ENABLE_IMAGE="true"
 declare -g USE_WAYLAND_WATCH="true"
-declare -g MACOS_EVENT_MODE="polling"
+declare -g MACOS_EVENT_MODE="fifo"
 declare -g MACOS_EVENT_FIFO="/tmp/clipboard-sync.fifo"
+declare -g MACOS_PUSH_IMAGE="/tmp/clipboard-sync-push.png"
 declare -g MACOS_IMAGE_CHECK_INTERVAL="5"
 declare -g NOTIFICATIONS_ENABLED="true"
-declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=5"
+declare -g SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 declare -g SSH_MUX_ENABLED="true"
-declare -g SSH_MUX_PERSIST="300"
+declare -g SSH_MUX_PERSIST="600"
 
 # === PATHS ===
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONFIG_FILE="$HOME/.config/clipboard-sync/config.ini"
-readonly STATE_DIR="$HOME/.local/state/clipboard-sync"
+readonly CONFIG_FILE="${CLIPBOARD_SYNC_CONFIG:-$HOME/.config/clipboard-sync/config.ini}"
+readonly STATE_DIR="${CLIPBOARD_SYNC_STATE:-$HOME/.local/state/clipboard-sync}"
 readonly STATE_TEXT_HASH="$STATE_DIR/text_hash"
 readonly STATE_IMAGE_HASH="$STATE_DIR/image_hash"
 readonly STATE_MACOS_CHANGE_COUNT="$STATE_DIR/macos_change_count"
-readonly TEMP_DIR="/tmp/clipboard_sync_$$"
+readonly LOCK_FILE="$STATE_DIR/sync.lock"
 readonly SSH_MUX_DIR="$HOME/.cache/clipboard-sync/ssh-mux"
+TEMP_DIR=""
 
-# === STATE ===
-LAST_TEXT_HASH=""
-LAST_IMAGE_HASH=""
-LAST_MACOS_CHANGE_COUNT=""
-MACOS_IMAGE_CHANGE_COUNT_SUPPORTED=""
-MACOS_IMAGE_NEXT_CHANGE_CHECK=0
-MACOS_IMAGE_NEXT_POLL=0
-TEXT_WATCH_PID=""
-TEXT_WATCH_FD=""
-IMG_WATCH_PID=""
-IMG_WATCH_FD=""
-MACOS_FIFO_PID=""
-MACOS_FIFO_FD=""
+# === RUNTIME PIDS ===
+OUTBOUND_PID=""
+INBOUND_PID=""
+SAFETY_PID=""
 CLEANUP_DONE="false"
 
 # === INI PARSER ===
 parse_config() {
     local config_file="$1"
     local current_section=""
-    
+
     if [[ ! -f "$config_file" ]]; then
         echo "Warning: Config file not found at $config_file, using defaults" >&2
         return 1
     fi
-    
+
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip empty lines and comments
         [[ -z "$line" ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        
-        # Check for section headers
+
         if [[ "$line" =~ ^\[([^\]]+)\] ]]; then
             current_section="${BASH_REMATCH[1]}"
             continue
         fi
-        
-        # Parse key=value pairs
+
         if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
             local key="${BASH_REMATCH[1]}"
             local value="${BASH_REMATCH[2]}"
-            
-            # Trim whitespace
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            
-            # Map config keys to variables based on section
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
             case "$current_section" in
                 remote)
                     case "$key" in
@@ -101,6 +95,7 @@ parse_config() {
                         use_wayland_watch) USE_WAYLAND_WATCH="$value" ;;
                         macos_event_mode) MACOS_EVENT_MODE="$value" ;;
                         macos_event_fifo) MACOS_EVENT_FIFO="$value" ;;
+                        macos_push_image) MACOS_PUSH_IMAGE="$value" ;;
                         macos_image_check_interval) MACOS_IMAGE_CHECK_INTERVAL="$value" ;;
                     esac
                     ;;
@@ -119,98 +114,37 @@ parse_config() {
             esac
         fi
     done < "$config_file"
-    
     return 0
 }
 
 validate_config() {
     local errors=0
-    
     if [[ -z "$REMOTE_USER" ]]; then
         echo "Error: remote.user not configured" >&2
         errors=$((errors + 1))
     fi
-    
     if [[ -z "$REMOTE_HOST" ]]; then
         echo "Error: remote.host not configured" >&2
         errors=$((errors + 1))
     fi
-    
     if [[ $errors -gt 0 ]]; then
         echo "Please configure $CONFIG_FILE" >&2
         return 1
     fi
-    
     return 0
 }
 
-# === SETUP ===
+# === SETUP / CLEANUP ===
 setup() {
-    mkdir -p "$TEMP_DIR"
-    chmod 700 "$TEMP_DIR" 2>/dev/null || true
-    
+    TEMP_DIR=$(mktemp -d /tmp/clipboard_sync.XXXXXX)
+    chmod 700 "$TEMP_DIR"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR" 2>/dev/null || true
-    
-    # Setup SSH multiplexing directory
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         mkdir -p "$SSH_MUX_DIR"
         chmod 700 "$SSH_MUX_DIR" 2>/dev/null || true
     fi
-    
-    touch "$STATE_TEXT_HASH" "$STATE_IMAGE_HASH"
-    LAST_TEXT_HASH=$(cat "$STATE_TEXT_HASH" 2>/dev/null || echo "")
-    LAST_IMAGE_HASH=$(cat "$STATE_IMAGE_HASH" 2>/dev/null || echo "")
-    LAST_MACOS_CHANGE_COUNT=$(cat "$STATE_MACOS_CHANGE_COUNT" 2>/dev/null || echo "")
-}
-
-# Get SSH socket path for current connection
-get_ssh_socket() {
-    # Use shorter hash to avoid path length issues with Unix domain sockets
-    # OpenSSH has a ~100 character limit on the ControlPath
-    local conn_string="${REMOTE_USER}@${REMOTE_HOST}"
-    local socket_hash
-    socket_hash=$(echo -n "$conn_string" | md5sum | awk '{print $1}' | cut -c1-16)
-    echo "$SSH_MUX_DIR/$socket_hash"
-}
-
-# Ensure SSH master connection is established (for multiplexing)
-ensure_ssh_master() {
-    if [[ "$SSH_MUX_ENABLED" != "true" ]]; then
-        return 0
-    fi
-    
-    local socket
-    socket=$(get_ssh_socket)
-    
-    # Check if master connection already exists and is alive
-    if [[ -S "$socket" ]]; then
-        # Verify it's still alive
-        if ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null; then
-            return 0
-        fi
-        # Dead socket, remove it
-        rm -f "$socket"
-    elif [[ -e "$socket" ]]; then
-        # Regular file exists at socket path (stale from previous failed attempt)
-        # Remove it before creating new socket
-        rm -f "$socket"
-    fi
-    
-    # Establish new master connection in background
-    ssh -fN -M -S "$socket" \
-        -o ControlPersist="$SSH_MUX_PERSIST" \
-        $SSH_OPTS \
-        "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null
-    
-    # Wait for socket to be created (up to 5 seconds)
-    local waited=0
-    while [[ ! -S "$socket" ]] && [[ $waited -lt 50 ]]; do
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-    
-    [[ -S "$socket" ]]
+    touch "$STATE_TEXT_HASH" "$STATE_IMAGE_HASH" "$LOCK_FILE"
 }
 
 cleanup() {
@@ -219,46 +153,206 @@ cleanup() {
     fi
     CLEANUP_DONE="true"
 
-    rm -rf "$TEMP_DIR" 2>/dev/null || true
+    local pid
+    for pid in "$OUTBOUND_PID" "$INBOUND_PID" "$SAFETY_PID"; do
+        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 0.15
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
 
-    stop_wayland_watchers
-    stop_macos_fifo_reader
+    [[ -n "${TEMP_DIR:-}" ]] && rm -rf "$TEMP_DIR" 2>/dev/null || true
 
-    # Close SSH master connection if we started it
     if [[ "$SSH_MUX_ENABLED" == "true" ]] && [[ -n "${REMOTE_USER:-}" ]] && [[ -n "${REMOTE_HOST:-}" ]]; then
         local socket
-        socket=$(get_ssh_socket 2>/dev/null) || return
-        if [[ -S "$socket" ]]; then
+        socket=$(get_ssh_socket 2>/dev/null) || true
+        if [[ -n "${socket:-}" ]] && [[ -S "$socket" ]]; then
             ssh -O exit -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null || true
         fi
     fi
 }
 
 handle_shutdown() {
+    log_info "Shutting down..."
     cleanup
     exit 0
 }
 
-# === UTILITIES ===
+# === LOGGING ===
+log() {
+    local level="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+}
+log_info()  { log "INFO" "$@"; }
+log_warn()  { log "WARN" "$@"; }
+log_error() { log "ERROR" "$@"; }
+log_debug() {
+    if [[ "${DEBUG:-false}" == "true" ]]; then
+        log "DEBUG" "$@"
+    fi
+}
 
-# Ensure string is valid UTF-8 and strip null bytes
+# === SSH MULTIPLEXING ===
+get_ssh_socket() {
+    local conn_string="${REMOTE_USER}@${REMOTE_HOST}"
+    local socket_hash
+    socket_hash=$(printf '%s' "$conn_string" | md5sum | awk '{print $1}' | cut -c1-16)
+    echo "$SSH_MUX_DIR/$socket_hash"
+}
+
+ensure_ssh_master() {
+    if [[ "$SSH_MUX_ENABLED" != "true" ]]; then
+        return 0
+    fi
+
+    local socket
+    socket=$(get_ssh_socket)
+
+    if [[ -S "$socket" ]]; then
+        if ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$socket"
+    elif [[ -e "$socket" ]]; then
+        rm -f "$socket"
+    fi
+
+    log_info "Opening SSH master to $REMOTE_USER@$REMOTE_HOST"
+    # shellcheck disable=SC2086
+    if ! ssh -fN -M -S "$socket" \
+        -o ControlPersist="$SSH_MUX_PERSIST" \
+        $SSH_OPTS \
+        "$REMOTE_USER@$REMOTE_HOST" 2>"$TEMP_DIR/ssh_master.err"; then
+        log_error "SSH master failed: $(tr '\n' ' ' < "$TEMP_DIR/ssh_master.err" 2>/dev/null || true)"
+        return 1
+    fi
+
+    local waited=0
+    while [[ ! -S "$socket" ]] && [[ $waited -lt 50 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+
+    if [[ -S "$socket" ]]; then
+        return 0
+    fi
+    log_error "SSH master socket not created"
+    return 1
+}
+
+# Run remote command over mux (stderr preserved to log file on failure)
+ssh_run() {
+    local errf="$TEMP_DIR/ssh_run_$$.err"
+    local rc=0
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        # shellcheck disable=SC2086
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "$@" 2>"$errf" || rc=$?
+    else
+        # shellcheck disable=SC2086
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "$@" 2>"$errf" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        local err
+        err=$(tr '\n' ' ' < "$errf" 2>/dev/null || true)
+        [[ -n "$err" ]] && log_warn "ssh failed (rc=$rc): $err"
+    fi
+    rm -f "$errf"
+    return $rc
+}
+
+# Pipe stdin to remote command
+ssh_pipe() {
+    local errf="$TEMP_DIR/ssh_pipe_$$.err"
+    local rc=0
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        # shellcheck disable=SC2086
+        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "$@" 2>"$errf" || rc=$?
+    else
+        # shellcheck disable=SC2086
+        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "$@" 2>"$errf" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        local err
+        err=$(tr '\n' ' ' < "$errf" 2>/dev/null || true)
+        [[ -n "$err" ]] && log_warn "ssh pipe failed (rc=$rc): $err"
+    fi
+    rm -f "$errf"
+    return $rc
+}
+
+scp_to() {
+    local src="$1" dst="$2"
+    local errf="$TEMP_DIR/scp_$$.err"
+    local rc=0
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        # shellcheck disable=SC2086
+        scp -o ControlPath="$socket" -q $SSH_OPTS "$src" "$REMOTE_USER@$REMOTE_HOST:$dst" 2>"$errf" || rc=$?
+    else
+        # shellcheck disable=SC2086
+        scp -q $SSH_OPTS "$src" "$REMOTE_USER@$REMOTE_HOST:$dst" 2>"$errf" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        log_warn "scp to remote failed (rc=$rc): $(tr '\n' ' ' < "$errf" 2>/dev/null || true)"
+    fi
+    rm -f "$errf"
+    return $rc
+}
+
+scp_from() {
+    local src="$1" dst="$2"
+    local errf="$TEMP_DIR/scp_$$.err"
+    local rc=0
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        # shellcheck disable=SC2086
+        scp -o ControlPath="$socket" -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$src" "$dst" 2>"$errf" || rc=$?
+    else
+        # shellcheck disable=SC2086
+        scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$src" "$dst" 2>"$errf" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        log_warn "scp from remote failed (rc=$rc): $(tr '\n' ' ' < "$errf" 2>/dev/null || true)"
+    fi
+    rm -f "$errf"
+    return $rc
+}
+
+check_connection() {
+    ensure_ssh_master || return 1
+    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+        local socket
+        socket=$(get_ssh_socket)
+        ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null
+    else
+        # shellcheck disable=SC2086
+        ssh -n $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "true" 2>/dev/null
+    fi
+}
+
+# === HASH / STATE (flock-protected) ===
 ensure_utf8() {
     local input="$1"
-    echo -n "$input" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr -d '\000' || echo -n "$input"
+    printf '%s' "$input" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr -d '\000' || printf '%s' "$input"
 }
 
-# Get SHA-256 hash of text (trailing whitespace trimmed)
 get_text_hash() {
-    echo -n "$1" | sed 's/[[:space:]]*$//' | sha256sum | awk '{print $1}'
+    printf '%s' "$1" | sed 's/[[:space:]]*$//' | sha256sum | awk '{print $1}'
 }
 
-# Get SHA-256 hash of file
 get_file_hash() {
     sha256sum "$1" | awk '{print $1}'
 }
 
-# Get a stable hash of image pixels. Clipboard APIs may re-encode PNG bytes
-# without changing the visible image, so byte hashes are not stable enough.
 get_image_hash() {
     local file="$1"
     local hash=""
@@ -267,10 +361,8 @@ get_image_hash() {
         hash=$(python3 - "$file" <<'PY' 2>/dev/null || true
 import hashlib
 import sys
-
 try:
     from PIL import Image, ImageOps
-
     path = sys.argv[1]
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img).convert("RGBA")
@@ -305,357 +397,143 @@ PY
     get_file_hash "$file"
 }
 
-# Escape notification content for notify-send
-escape_notification() {
-    local text="$1"
-    # Prepend space to prevent leading dash interpretation
-    echo " $text" | sed 's/%/%%/g; s/\\/\\\\/g; s/"/\\"/g'
+with_lock() {
+    (
+        flock -w 5 9 || { log_warn "lock timeout"; exit 1; }
+        "$@"
+    ) 9>"$LOCK_FILE"
 }
 
-# === LOGGING ===
-# All output goes to stderr so systemd/journalctl captures it.
-log() {
-    local level="$1"
-    shift
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*" >&2
+read_text_hash() { cat "$STATE_TEXT_HASH" 2>/dev/null || echo ""; }
+read_image_hash() { cat "$STATE_IMAGE_HASH" 2>/dev/null || echo ""; }
+
+write_text_hash() {
+    printf '%s' "$1" > "$STATE_TEXT_HASH"
 }
-
-log_info()  { log "INFO" "$@"; }
-log_warn()  { log "WARN" "$@"; }
-log_error() { log "ERROR" "$@"; }
-log_debug() {
-    if [[ "${DEBUG:-false}" == "true" ]]; then
-        log "DEBUG" "$@"
-    fi
-}
-
-# Check SSH connection health
-check_connection() {
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        ensure_ssh_master || return 1
-        local socket
-        socket=$(get_ssh_socket)
-        ssh -O check -S "$socket" "$REMOTE_USER@$REMOTE_HOST" 2>/dev/null
-    else
-        ssh -n $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "true" 2>/dev/null
-    fi
-}
-
-# === PUSH OPERATIONS (Linux → macOS) ===
-
-push_text_to_macos() {
-    local text="$1"
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        printf '%s' "$text" | ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
-    else
-        printf '%s' "$text" | ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; pbcopy" 2>/dev/null
-    fi
-}
-
-push_image_to_macos() {
-    local img="$1"
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        scp -o ControlPath="$socket" -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
-        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
-    else
-        scp -q $SSH_OPTS "$img" "$REMOTE_USER@$REMOTE_HOST:/tmp/clipboard_sync.png" 2>/dev/null || return 1
-        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png" 2>/dev/null
-    fi
-}
-
-# === PULL OPERATIONS (macOS → Linux) ===
-
-pull_text_from_macos() {
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
-    else
-        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; pbpaste" 2>/dev/null || echo ""
-    fi
-}
-
-pull_image_from_macos() {
-    local tmp="$TEMP_DIR/macos_image_$$.png"
-    local mac_path
-
-    # Try to copy image from macOS
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        log_debug "pull_image_from_macos: using mux socket"
-        mac_path=$(ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
-    else
-        log_debug "pull_image_from_macos: using direct ssh"
-        mac_path=$(ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png 2>/dev/null && echo /tmp/clipboard_pull_$$.png" 2>/dev/null) || return 1
-    fi
-
-    # Validate returned path
-    if [[ -z "$mac_path" ]] || [[ "$mac_path" == *\** ]] || [[ "$mac_path" != /tmp/* ]]; then
-        return 1
-    fi
-
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        scp -o ControlPath="$socket" -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
-        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
-    else
-        scp -q $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST:$mac_path" "$tmp" 2>/dev/null || return 1
-        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "rm -f $mac_path" 2>/dev/null || true
-    fi
-
-    if [[ -s "$tmp" ]]; then
-        echo "$tmp"
-    else
-        rm -f "$tmp"
-        return 1
-    fi
-}
-
-get_macos_change_count() {
-    if [[ -z "$MACOS_IMAGE_COPY_PATH" ]]; then
-        return 1
-    fi
-
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH --change-count 2>/dev/null || osascript -l JavaScript -e 'ObjC.import(\"AppKit\"); \$.NSPasteboard.generalPasteboard.changeCount'" 2>/dev/null |
-            awk '/^[0-9]+$/ { count = $0 } END { if (count != "") print count; else exit 1 }'
-    else
-        ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "$MACOS_IMAGE_COPY_PATH --change-count 2>/dev/null || osascript -l JavaScript -e 'ObjC.import(\"AppKit\"); \$.NSPasteboard.generalPasteboard.changeCount'" 2>/dev/null |
-            awk '/^[0-9]+$/ { count = $0 } END { if (count != "") print count; else exit 1 }'
-    fi
+write_image_hash() {
+    printf '%s' "$1" > "$STATE_IMAGE_HASH"
 }
 
 # === NOTIFICATIONS ===
+escape_notification() {
+    local text="$1"
+    echo " $text" | sed 's/%/%%/g; s/\\/\\\\/g; s/"/\\"/g'
+}
 
 notify_linux() {
-    local title="$1"
-    local content="$2"
-    
-    if [[ "$NOTIFICATIONS_ENABLED" != "true" ]]; then
-        return
-    fi
-    
-    local escaped_title escaped_content
-
-    escaped_title=$(escape_notification "$title")
-    escaped_content=$(escape_notification "$content")
-
-    notify-send "$escaped_title" "$escaped_content" 2>/dev/null || true
+    [[ "$NOTIFICATIONS_ENABLED" == "true" ]] || return 0
+    local title="$1" content="$2"
+    notify-send "$(escape_notification "$title")" "$(escape_notification "$content")" 2>/dev/null || true
 }
 
 notify_macos() {
-    local title="$1"
-    local content="$2"
-    
-    if [[ "$NOTIFICATIONS_ENABLED" != "true" ]]; then
-        return
-    fi
-    
-    local truncated=""
-
+    [[ "$NOTIFICATIONS_ENABLED" == "true" ]] || return 0
+    local title="$1" content="$2" truncated
     if [[ ${#content} -gt 100 ]]; then
         truncated="${content:0:100}..."
     else
         truncated="$content"
     fi
-
     truncated=$(printf '%s' "$truncated" | sed 's/\\/\\\\/g; s/"/\\"/g')
     title=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
-    if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        local socket
-        socket=$(get_ssh_socket)
-        printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
-            ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
-    else
-        printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
-            ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-            "export LC_CTYPE=en_US.UTF-8; osascript -" 2>/dev/null || true
-    fi
+    printf 'display notification "%s" with title "%s"' "$truncated" "$title" | \
+        ssh_pipe "export LC_CTYPE=en_US.UTF-8; osascript -" || true
 }
 
-# === LINUX POLLING ===
+# === PUSH / APPLY ===
+push_text_to_macos() {
+    local text="$1"
+    printf '%s' "$text" | ssh_pipe "export LC_CTYPE=en_US.UTF-8; pbcopy"
+}
 
-poll_linux_text() {
-    if [[ "$ENABLE_TEXT" != "true" ]]; then
-        return
+push_image_to_macos() {
+    local img="$1"
+    if [[ -z "$MACOS_IMAGE_COPY_PATH" ]]; then
+        log_error "remote.image_copy_path not set; cannot push images"
+        return 1
     fi
-    
+    scp_to "$img" "/tmp/clipboard_sync.png" || return 1
+    ssh_run "$MACOS_IMAGE_COPY_PATH /tmp/clipboard_sync.png && rm -f /tmp/clipboard_sync.png"
+}
+
+apply_text_to_linux() {
+    local text="$1"
+    printf '%s' "$text" | timeout 3 wl-copy -t text/plain
+}
+
+apply_image_to_linux() {
+    local img="$1"
+    timeout 3 wl-copy --type image/png < "$img"
+}
+
+# === OUTBOUND: Linux → macOS ===
+handle_linux_text_change() {
+    [[ "$ENABLE_TEXT" == "true" ]] || return 0
+
     local linux_text
-    # timeout: wl-paste blocks forever on Wayland when no selection owner exists
     linux_text=$(timeout 2 wl-paste -t text/plain 2>/dev/null || echo "")
-
-    if [[ ${#linux_text} -lt $MIN_LENGTH ]]; then
-        return
-    fi
+    [[ ${#linux_text} -ge $MIN_LENGTH ]] || return 0
 
     linux_text=$(ensure_utf8 "$linux_text")
-    local current_hash
+    local current_hash last
     current_hash=$(get_text_hash "$linux_text")
+    last=$(read_text_hash)
+    [[ "$current_hash" == "$last" ]] && return 0
 
-    if [[ "$current_hash" != "$LAST_TEXT_HASH" ]]; then
-        if check_connection && push_text_to_macos "$linux_text"; then
-            LAST_TEXT_HASH="$current_hash"
-            echo "$LAST_TEXT_HASH" > "$STATE_TEXT_HASH"
-            echo "[$(date '+%H:%M:%S')] Text pushed to macOS"
-            notify_macos "Clipboard Sync" "$linux_text"
-        fi
+    if ! ensure_ssh_master; then
+        log_error "outbound text: SSH unavailable"
+        return 1
+    fi
+
+    if push_text_to_macos "$linux_text"; then
+        with_lock write_text_hash "$current_hash"
+        log_info "→ macOS text (${#linux_text} chars)"
+        notify_macos "Clipboard Sync" "$linux_text"
+    else
+        log_error "→ macOS text push failed"
+        return 1
     fi
 }
 
-poll_linux_image() {
-    if [[ "$ENABLE_IMAGE" != "true" ]]; then
-        return
-    fi
-    
+handle_linux_image_change() {
+    [[ "$ENABLE_IMAGE" == "true" ]] || return 0
+
     local image_type
     image_type=$(timeout 2 wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
+    [[ -n "$image_type" ]] || return 0
 
-    if [[ -z "$image_type" ]]; then
-        return
-    fi
-
-    local tmp_img="$TEMP_DIR/linux_image_$$.${image_type#image/}"
-    if ! timeout 2 wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null; then
+    local tmp_img="$TEMP_DIR/linux_out.$$.${image_type#image/}"
+    if ! timeout 2 wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null || [[ ! -s "$tmp_img" ]]; then
         rm -f "$tmp_img"
-        return
-    fi
-
-    if [[ ! -s "$tmp_img" ]]; then
-        rm -f "$tmp_img"
-        return
+        return 0
     fi
 
     local current_hash
     current_hash=$(get_image_hash "$tmp_img")
-
-    if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
-        if check_connection && push_image_to_macos "$tmp_img"; then
-            LAST_IMAGE_HASH="$current_hash"
-            echo "$LAST_IMAGE_HASH" > "$STATE_IMAGE_HASH"
-            echo "[$(date '+%H:%M:%S')] Image pushed to macOS"
-            notify_macos "Clipboard Sync" "Image received from Linux"
-        fi
+    local last
+    last=$(read_image_hash)
+    if [[ "$current_hash" == "$last" ]]; then
+        rm -f "$tmp_img"
+        return 0
     fi
 
+    if ! ensure_ssh_master; then
+        log_error "outbound image: SSH unavailable"
+        rm -f "$tmp_img"
+        return 1
+    fi
+
+    if push_image_to_macos "$tmp_img"; then
+        with_lock write_image_hash "$current_hash"
+        log_info "→ macOS image"
+        notify_macos "Clipboard Sync" "Image received from Linux"
+    else
+        log_error "→ macOS image push failed"
+        rm -f "$tmp_img"
+        return 1
+    fi
     rm -f "$tmp_img"
 }
-
-# === MACOS POLLING ===
-
-poll_macos_text() {
-    if [[ "$ENABLE_TEXT" != "true" ]]; then
-        return
-    fi
-    
-    local mac_text
-    mac_text=$(pull_text_from_macos)
-
-    if [[ ${#mac_text} -lt $MIN_LENGTH ]]; then
-        return
-    fi
-
-    mac_text=$(ensure_utf8 "$mac_text")
-    local current_hash
-    current_hash=$(get_text_hash "$mac_text")
-
-    if [[ "$current_hash" != "$LAST_TEXT_HASH" ]]; then
-        if printf '%s' "$mac_text" | timeout 2 wl-copy -t text/plain 2>/dev/null; then
-            LAST_TEXT_HASH="$current_hash"
-            echo "$LAST_TEXT_HASH" > "$STATE_TEXT_HASH"
-            echo "[$(date '+%H:%M:%S')] Text pulled from macOS"
-            notify_linux "Clipboard Sync" "$mac_text"
-        fi
-    fi
-}
-
-poll_macos_image() {
-    if [[ "$ENABLE_IMAGE" != "true" ]]; then
-        return
-    fi
-
-    local now
-    now=$(date +%s)
-
-    local macos_change_count=""
-    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" != "false" ]]; then
-        if [[ "$now" -lt "$MACOS_IMAGE_NEXT_CHANGE_CHECK" ]]; then
-            return
-        fi
-        MACOS_IMAGE_NEXT_CHANGE_CHECK=$((now + MACOS_IMAGE_CHECK_INTERVAL))
-
-        macos_change_count=$(get_macos_change_count) || macos_change_count=""
-        if [[ "$macos_change_count" =~ ^[0-9]+$ ]]; then
-            MACOS_IMAGE_CHANGE_COUNT_SUPPORTED="true"
-            if [[ "$macos_change_count" == "$LAST_MACOS_CHANGE_COUNT" ]]; then
-                return
-            fi
-        else
-            if [[ -z "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" ]]; then
-                log_warn "macOS image helper lacks --change-count; throttling fallback image polling"
-            fi
-            MACOS_IMAGE_CHANGE_COUNT_SUPPORTED="false"
-        fi
-    fi
-
-    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "false" ]]; then
-        if [[ "$now" -lt "$MACOS_IMAGE_NEXT_POLL" ]]; then
-            return
-        fi
-        MACOS_IMAGE_NEXT_POLL=$((now + 10))
-    fi
-    
-    local tmp_mac_img
-    tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
-
-    if [[ ! -f "$tmp_mac_img" ]]; then
-        if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "true" ]]; then
-            LAST_MACOS_CHANGE_COUNT="$macos_change_count"
-            echo "$LAST_MACOS_CHANGE_COUNT" > "$STATE_MACOS_CHANGE_COUNT"
-        fi
-        return
-    fi
-
-    local current_hash
-    current_hash=$(get_image_hash "$tmp_mac_img")
-
-    if [[ "$current_hash" != "$LAST_IMAGE_HASH" ]]; then
-        if timeout 2 wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
-            LAST_IMAGE_HASH="$current_hash"
-            echo "$LAST_IMAGE_HASH" > "$STATE_IMAGE_HASH"
-            echo "[$(date '+%H:%M:%S')] Image pulled from macOS"
-            notify_linux "Clipboard Sync [IMAGE]" "Image copied"
-        fi
-    fi
-
-    if [[ "$MACOS_IMAGE_CHANGE_COUNT_SUPPORTED" == "true" ]]; then
-        LAST_MACOS_CHANGE_COUNT="$macos_change_count"
-        echo "$LAST_MACOS_CHANGE_COUNT" > "$STATE_MACOS_CHANGE_COUNT"
-    fi
-
-    rm -f "$tmp_mac_img"
-}
-
-# === WAYLAND EVENT WATCHERS ===
 
 wl_paste_watch_supported() {
     command -v wl-paste >/dev/null 2>&1 || return 1
@@ -663,237 +541,360 @@ wl_paste_watch_supported() {
 }
 
 wayland_watch_available() {
-    if [[ "$USE_WAYLAND_WATCH" != "true" ]]; then
-        return 1
-    fi
+    [[ "$USE_WAYLAND_WATCH" == "true" ]] || return 1
     if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-        log_warn "WAYLAND_DISPLAY not set, falling back to polling"
+        log_warn "WAYLAND_DISPLAY not set; outbound falls back to polling"
         return 1
     fi
     if ! command -v wl-paste >/dev/null 2>&1; then
-        log_warn "wl-paste not found, falling back to polling"
+        log_warn "wl-paste not found; outbound falls back to polling"
         return 1
     fi
     if ! wl_paste_watch_supported; then
-        log_warn "wl-paste does not support --watch, falling back to polling"
+        log_warn "wl-paste lacks --watch (use original wl-clipboard); outbound polling"
         return 1
     fi
     return 0
 }
 
-start_wayland_watchers() {
-    # Use differently-named variables for the coprocess because bash unsets the
-    # special coproc PID variable once the child is reaped.
-    coproc _TEXT_WATCH { exec wl-paste --type text --watch printf 'TEXT_CHANGED\n'; }
-    TEXT_WATCH_PID=${_TEXT_WATCH_PID:-}
-    TEXT_WATCH_FD=${_TEXT_WATCH[0]:-}
+# Outbound worker: event-driven Wayland → push (own process)
+run_outbound_watch_worker() {
+    log_info "Outbound worker: Wayland watch mode"
 
-    coproc _IMG_WATCH { exec wl-paste --type image/png --watch printf 'IMG_CHANGED\n'; }
-    IMG_WATCH_PID=${_IMG_WATCH_PID:-}
-    IMG_WATCH_FD=${_IMG_WATCH[0]:-}
+    # Separate loops so text and image never block each other.
+    (
+        while true; do
+            # wl-paste --watch runs the command on each clipboard change
+            if ! wl-paste --type text --watch printf 'T\n' 2>"$TEMP_DIR/wl_text.err" | while IFS= read -r _; do
+                handle_linux_text_change || true
+            done; then
+                log_warn "text watch pipeline ended: $(tr '\n' ' ' < "$TEMP_DIR/wl_text.err" 2>/dev/null || true)"
+            fi
+            sleep 0.5
+        done
+    ) &
+    local text_loop_pid=$!
 
-    sleep 0.2
-    if [[ -z "$TEXT_WATCH_PID" ]] || [[ -z "$IMG_WATCH_PID" ]] || \
-       ! kill -0 "$TEXT_WATCH_PID" 2>/dev/null || ! kill -0 "$IMG_WATCH_PID" 2>/dev/null; then
-        log_error "wl-paste watcher(s) failed to start"
-        stop_wayland_watchers
+    (
+        while true; do
+            if ! wl-paste --type image/png --watch printf 'I\n' 2>"$TEMP_DIR/wl_img.err" | while IFS= read -r _; do
+                handle_linux_image_change || true
+            done; then
+                log_warn "image watch pipeline ended: $(tr '\n' ' ' < "$TEMP_DIR/wl_img.err" 2>/dev/null || true)"
+            fi
+            sleep 0.5
+        done
+    ) &
+    local img_loop_pid=$!
+
+    wait "$text_loop_pid" "$img_loop_pid" 2>/dev/null || true
+}
+
+run_outbound_poll_worker() {
+    log_info "Outbound worker: polling every ${POLL_INTERVAL}s (min 1s for outbound)"
+    local interval="$POLL_INTERVAL"
+    [[ "$interval" -lt 1 ]] && interval=1
+    # When inbound is push-based, outbound poll can stay fairly responsive
+    if [[ "$MACOS_EVENT_MODE" == "fifo" ]] && [[ "$interval" -gt 2 ]]; then
+        interval=1
+    fi
+    while true; do
+        handle_linux_text_change || true
+        handle_linux_image_change || true
+        sleep "$interval"
+    done
+}
+
+# === INBOUND: macOS → Linux (push payload) ===
+apply_macos_text_payload() {
+    local b64="$1"
+    local mac_text
+    if ! mac_text=$(printf '%s' "$b64" | base64 -d 2>/dev/null); then
+        log_warn "← invalid TEXT base64"
         return 1
     fi
-    log_info "Wayland event watchers started (text=$TEXT_WATCH_PID image=$IMG_WATCH_PID)"
-    return 0
+    [[ ${#mac_text} -ge $MIN_LENGTH ]] || return 0
+    mac_text=$(ensure_utf8 "$mac_text")
+    local current_hash
+    current_hash=$(get_text_hash "$mac_text")
+    local last
+    last=$(read_text_hash)
+    [[ "$current_hash" == "$last" ]] && return 0
+
+    if apply_text_to_linux "$mac_text"; then
+        with_lock write_text_hash "$current_hash"
+        log_info "← Linux text (${#mac_text} chars) [push]"
+        notify_linux "Clipboard Sync" "$mac_text"
+    else
+        log_error "← wl-copy text failed"
+        return 1
+    fi
 }
 
-stop_wayland_watchers() {
-    local pid
-    for pid in "$TEXT_WATCH_PID" "$IMG_WATCH_PID"; do
-        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            sleep 0.2
-            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
-    TEXT_WATCH_PID=""
-    IMG_WATCH_PID=""
+apply_macos_imgfile() {
+    local remote_path="$1"
+    # Path must be absolute under /tmp for safety
+    if [[ "$remote_path" != /tmp/* ]] || [[ "$remote_path" == *..* ]] || [[ "$remote_path" == *$'\n'* ]]; then
+        log_warn "← rejected IMGFILE path: $remote_path"
+        return 1
+    fi
+
+    local tmp_img="$TEMP_DIR/macos_in.$$.png"
+    if ! scp_from "$remote_path" "$tmp_img"; then
+        log_error "← scp IMGFILE failed"
+        return 1
+    fi
+    if [[ ! -s "$tmp_img" ]]; then
+        rm -f "$tmp_img"
+        log_warn "← empty IMGFILE"
+        return 1
+    fi
+
+    local current_hash
+    current_hash=$(get_image_hash "$tmp_img")
+    local last
+    last=$(read_image_hash)
+    if [[ "$current_hash" == "$last" ]]; then
+        rm -f "$tmp_img"
+        return 0
+    fi
+
+    if apply_image_to_linux "$tmp_img"; then
+        with_lock write_image_hash "$current_hash"
+        log_info "← Linux image [push]"
+        notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+    else
+        log_error "← wl-copy image failed"
+        rm -f "$tmp_img"
+        return 1
+    fi
+    rm -f "$tmp_img"
 }
 
-run_watch_loop() {
-    local last_watchdog last_macos_poll now
-    last_watchdog=$(date +%s)
-    last_macos_poll=$(date +%s)
+# Legacy: IMG:<base64> (small images / old daemon)
+apply_macos_img_b64() {
+    local b64="$1"
+    local tmp_img="$TEMP_DIR/macos_b64.$$.png"
+    if ! printf '%s' "$b64" | base64 -d > "$tmp_img" 2>/dev/null || [[ ! -s "$tmp_img" ]]; then
+        rm -f "$tmp_img"
+        log_warn "← invalid IMG base64"
+        return 1
+    fi
+    local current_hash
+    current_hash=$(get_image_hash "$tmp_img")
+    local last
+    last=$(read_image_hash)
+    if [[ "$current_hash" == "$last" ]]; then
+        rm -f "$tmp_img"
+        return 0
+    fi
+    if apply_image_to_linux "$tmp_img"; then
+        with_lock write_image_hash "$current_hash"
+        log_info "← Linux image [push-b64]"
+        notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+    else
+        log_error "← wl-copy image failed"
+        rm -f "$tmp_img"
+        return 1
+    fi
+    rm -f "$tmp_img"
+}
 
+handle_fifo_line() {
+    local line="$1"
+    [[ -z "$line" ]] && return 0
+
+    case "$line" in
+        TEXT:*)
+            [[ "$ENABLE_TEXT" == "true" ]] || return 0
+            apply_macos_text_payload "${line#TEXT:}" || true
+            ;;
+        IMGFILE:*)
+            [[ "$ENABLE_IMAGE" == "true" ]] || return 0
+            apply_macos_imgfile "${line#IMGFILE:}" || true
+            ;;
+        IMG:*)
+            [[ "$ENABLE_IMAGE" == "true" ]] || return 0
+            apply_macos_img_b64 "${line#IMG:}" || true
+            ;;
+        PING|ping)
+            log_debug "← fifo ping"
+            ;;
+        *)
+            # Unknown / truncated — treat as wake-up and fall back to one pull
+            log_warn "← unknown fifo event (len=${#line}); safety pull"
+            pull_macos_text_once || true
+            ;;
+    esac
+}
+
+run_inbound_fifo_worker() {
+    log_info "Inbound worker: Mac FIFO push stream ($MACOS_EVENT_FIFO)"
     while true; do
-        local changed=false event=""
-
-        # Drain all available text events
-        while read -r -t 0 -u "$TEXT_WATCH_FD" _ 2>/dev/null; do
-            read -r -u "$TEXT_WATCH_FD" event
-            if [[ "$event" == "TEXT_CHANGED" ]]; then
-                poll_linux_text
-                changed=true
-            fi
-        done
-
-        # Drain all available image events
-        while read -r -t 0 -u "$IMG_WATCH_FD" _ 2>/dev/null; do
-            read -r -u "$IMG_WATCH_FD" event
-            if [[ "$event" == "IMG_CHANGED" ]]; then
-                poll_linux_image
-                changed=true
-            fi
-        done
-
-        # Drain all available macOS FIFO events
-        if [[ -n "$MACOS_FIFO_FD" ]]; then
-            while read -r -t 0 -u "$MACOS_FIFO_FD" _ 2>/dev/null; do
-                read -r -u "$MACOS_FIFO_FD" event
-                handle_macos_fifo_event
-                changed=true
-            done
+        if ! ensure_ssh_master; then
+            log_error "inbound: SSH master down; retry in 3s"
+            sleep 3
+            continue
         fi
 
-        # Poll macOS clipboard on the configured interval as a safety net.
-        now=$(date +%s)
-        if [[ $((now - last_macos_poll)) -ge $POLL_INTERVAL ]]; then
-            poll_macos_text
-            poll_macos_image
-            last_macos_poll=$now
+        local socket=""
+        local errf="$TEMP_DIR/fifo_stream.err"
+        : > "$errf"
+
+        # Long-lived SSH that streams FIFO events with payload.
+        # Prefer mux ControlPath; reopen on disconnect.
+        if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
+            socket=$(get_ssh_socket)
+            # shellcheck disable=SC2086
+            ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+                "test -p '$MACOS_EVENT_FIFO' || { echo 'FIFO missing: start clipboard-sync-daemon on Mac' >&2; exit 2; }; cat '$MACOS_EVENT_FIFO'" \
+                2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
+                    handle_fifo_line "$line"
+                done
+        else
+            # shellcheck disable=SC2086
+            ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
+                "test -p '$MACOS_EVENT_FIFO' || { echo 'FIFO missing: start clipboard-sync-daemon on Mac' >&2; exit 2; }; cat '$MACOS_EVENT_FIFO'" \
+                2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
+                    handle_fifo_line "$line"
+                done
         fi
 
-        # Watchdog: check watcher health every 5s using elapsed time.
-        if [[ $((now - last_watchdog)) -ge 5 ]]; then
-            if ! kill -0 "$TEXT_WATCH_PID" 2>/dev/null || ! kill -0 "$IMG_WATCH_PID" 2>/dev/null; then
-                log_warn "Wayland watcher died, restarting..."
-                stop_wayland_watchers
-                if ! start_wayland_watchers; then
-                    log_warn "Wayland watcher restart failed, falling back to polling"
-                    return 1
-                fi
-            fi
-            if [[ -n "$MACOS_FIFO_PID" ]] && ! kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
-                log_warn "macOS FIFO reader died, restarting..."
-                stop_macos_fifo_reader
-                start_macos_fifo_reader || true
-            fi
-            last_watchdog=$now
+        local rc=${PIPESTATUS[0]:-1}
+        local err
+        err=$(tr '\n' ' ' < "$errf" 2>/dev/null || true)
+        if [[ $rc -eq 2 ]] || [[ "$err" == *"FIFO missing"* ]]; then
+            log_error "Mac FIFO not found at $MACOS_EVENT_FIFO — install/start clipboard-sync-daemon on macOS"
+            sleep 5
+        else
+            log_warn "inbound FIFO stream ended (rc=$rc); reconnecting in 1s${err:+ — $err}"
+            sleep 1
         fi
-
-        if ! $changed; then
-            sleep 0.2
-        fi
+        # Re-establish mux if needed
+        ensure_ssh_master || true
     done
 }
 
-run_polling_loop() {
+# Polling fallback for Mac → Linux
+pull_macos_text_once() {
+    [[ "$ENABLE_TEXT" == "true" ]] || return 0
+    ensure_ssh_master || return 1
+    local mac_text
+    mac_text=$(ssh_run "export LC_CTYPE=en_US.UTF-8; pbpaste" || true)
+    [[ ${#mac_text} -ge $MIN_LENGTH ]] || return 0
+    mac_text=$(ensure_utf8 "$mac_text")
+    local current_hash
+    current_hash=$(get_text_hash "$mac_text")
+    local last
+    last=$(read_text_hash)
+    [[ "$current_hash" == "$last" ]] && return 0
+    if apply_text_to_linux "$mac_text"; then
+        with_lock write_text_hash "$current_hash"
+        log_info "← Linux text (${#mac_text} chars) [poll]"
+        notify_linux "Clipboard Sync" "$mac_text"
+    fi
+}
+
+pull_macos_image_once() {
+    [[ "$ENABLE_IMAGE" == "true" ]] || return 0
+    [[ -n "$MACOS_IMAGE_COPY_PATH" ]] || return 0
+    ensure_ssh_master || return 1
+
+    local mac_path tmp_img
+    mac_path=$(ssh_run "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png >/dev/null && echo /tmp/clipboard_pull_$$.png" || true)
+    [[ -n "$mac_path" ]] || return 0
+    [[ "$mac_path" == /tmp/* ]] || return 1
+
+    tmp_img="$TEMP_DIR/macos_poll.$$.png"
+    scp_from "$mac_path" "$tmp_img" || return 1
+    ssh_run "rm -f $mac_path" || true
+    [[ -s "$tmp_img" ]] || { rm -f "$tmp_img"; return 0; }
+
+    local current_hash last
+    current_hash=$(get_image_hash "$tmp_img")
+    last=$(read_image_hash)
+    if [[ "$current_hash" != "$last" ]]; then
+        if apply_image_to_linux "$tmp_img"; then
+            with_lock write_image_hash "$current_hash"
+            log_info "← Linux image [poll]"
+            notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+        fi
+    fi
+    rm -f "$tmp_img"
+}
+
+run_inbound_poll_worker() {
+    log_info "Inbound worker: polling every ${POLL_INTERVAL}s (install Mac daemon for push)"
     while true; do
-        poll_linux_text
-        poll_linux_image
-        poll_macos_text
-        poll_macos_image
+        pull_macos_text_once || true
+        pull_macos_image_once || true
         sleep "$POLL_INTERVAL"
     done
 }
 
-# === MACOS FIFO EVENT READER (optional) ===
-
-macos_fifo_available() {
-    if [[ "$MACOS_EVENT_MODE" != "fifo" ]]; then
-        return 1
-    fi
-    if [[ -z "$MACOS_EVENT_FIFO" ]]; then
-        return 1
-    fi
-    return 0
-}
-
-start_macos_fifo_reader() {
-    coproc _MACOS_FIFO { exec ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "cat '$MACOS_EVENT_FIFO'"; }
-    MACOS_FIFO_PID=${_MACOS_FIFO_PID:-}
-    MACOS_FIFO_FD=${_MACOS_FIFO[0]:-}
-
-    sleep 0.2
-    if [[ -z "$MACOS_FIFO_PID" ]] || ! kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
-        log_warn "macOS FIFO reader failed to start"
-        stop_macos_fifo_reader
-        return 1
-    fi
-    log_info "macOS FIFO reader started (pid $MACOS_FIFO_PID)"
-    return 0
-}
-
-stop_macos_fifo_reader() {
-    if [[ -n "${MACOS_FIFO_PID:-}" ]] && kill -0 "$MACOS_FIFO_PID" 2>/dev/null; then
-        kill "$MACOS_FIFO_PID" 2>/dev/null || true
-        sleep 0.2
-        kill -0 "$MACOS_FIFO_PID" 2>/dev/null && kill -9 "$MACOS_FIFO_PID" 2>/dev/null || true
-        wait "$MACOS_FIFO_PID" 2>/dev/null || true
-    fi
-    MACOS_FIFO_PID=""
-}
-
-handle_macos_fifo_event() {
-    # The daemon sends the actual content, but for now we use the event purely
-    # as a trigger to pull the latest clipboard from macOS via SSH. A future
-    # optimization could decode the embedded content and skip the SSH round-trip.
-    poll_macos_text
-    poll_macos_image
+# Rare safety net when push mode is active
+run_safety_net_worker() {
+    local interval="$POLL_INTERVAL"
+    [[ "$interval" -lt 15 ]] && interval=30
+    log_info "Safety-net poll every ${interval}s"
+    while true; do
+        sleep "$interval"
+        ensure_ssh_master || continue
+        pull_macos_text_once || true
+        # Image safety net is heavier; only every other cycle-ish by sleeping more
+        pull_macos_image_once || true
+    done
 }
 
 # === ONE-SHOT COMMANDS ===
-
 cmd_sync_to() {
-    # One-shot push Linux clipboard to macOS
-    # Establish master connection for multiplexing
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         ensure_ssh_master || {
-            echo "Warning: SSH multiplexing setup failed, using direct connection" >&2
+            log_warn "SSH multiplexing setup failed, using direct connection"
             SSH_MUX_ENABLED="false"
         }
     fi
-    
     if ! check_connection; then
         echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
         return 1
     fi
 
-    # Try image first
     if [[ "$ENABLE_IMAGE" == "true" ]]; then
         local image_type
         image_type=$(timeout 2 wl-paste --list-types 2>/dev/null | grep -m1 "image/" || echo "")
-
         if [[ -n "$image_type" ]]; then
-            local tmp_img="$TEMP_DIR/sync_to_image_$$.${image_type#image/}"
+            local tmp_img="$TEMP_DIR/sync_to.$$.${image_type#image/}"
             if timeout 2 wl-paste --type "$image_type" > "$tmp_img" 2>/dev/null && [[ -s "$tmp_img" ]]; then
                 if push_image_to_macos "$tmp_img"; then
+                    local h
+                    h=$(get_image_hash "$tmp_img")
+                    with_lock write_image_hash "$h"
                     rm -f "$tmp_img"
                     notify_macos "Clipboard Sync" "Image received from Linux"
                     echo "Image synced to macOS"
                     return 0
-                else
-                    rm -f "$tmp_img"
-                    echo "Error: failed to push image to macOS" >&2
-                    return 1
                 fi
+                rm -f "$tmp_img"
+                echo "Error: failed to push image to macOS" >&2
+                return 1
             fi
             rm -f "$tmp_img"
         fi
     fi
 
-    # Fall back to text
     if [[ "$ENABLE_TEXT" == "true" ]]; then
         local linux_text
         linux_text=$(timeout 2 wl-paste -t text/plain 2>/dev/null || echo "")
-
         if [[ ${#linux_text} -ge $MIN_LENGTH ]]; then
             linux_text=$(ensure_utf8 "$linux_text")
             if push_text_to_macos "$linux_text"; then
+                with_lock write_text_hash "$(get_text_hash "$linux_text")"
                 notify_macos "Clipboard Sync" "$linux_text"
                 echo "Text synced to macOS (${#linux_text} chars)"
                 return 0
-            else
-                echo "Error: failed to push text to macOS" >&2
-                return 1
             fi
+            echo "Error: failed to push text to macOS" >&2
+            return 1
         fi
     fi
 
@@ -902,55 +903,50 @@ cmd_sync_to() {
 }
 
 cmd_sync_from() {
-    # One-shot pull macOS clipboard to Linux
-    # Establish master connection for multiplexing
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
         ensure_ssh_master || {
-            echo "Warning: SSH multiplexing setup failed, using direct connection" >&2
+            log_warn "SSH multiplexing setup failed, using direct connection"
             SSH_MUX_ENABLED="false"
         }
     fi
-    
     if ! check_connection; then
         echo "Error: cannot connect to $REMOTE_USER@$REMOTE_HOST" >&2
         return 1
     fi
 
-    # Try image first
-    if [[ "$ENABLE_IMAGE" == "true" ]]; then
-        local tmp_mac_img
-        tmp_mac_img=$(pull_image_from_macos) || tmp_mac_img=""
-
-        if [[ -n "$tmp_mac_img" ]] && [[ -f "$tmp_mac_img" ]]; then
-            if timeout 2 wl-copy --type image/png < "$tmp_mac_img" 2>/dev/null; then
-                rm -f "$tmp_mac_img"
-                notify_linux "Clipboard Sync [IMAGE]" "Image copied"
-                echo "Image synced from macOS"
-                return 0
-            else
-                rm -f "$tmp_mac_img"
-                echo "Warning: image pull succeeded but wl-copy failed, trying text" >&2
+    if [[ "$ENABLE_IMAGE" == "true" ]] && [[ -n "$MACOS_IMAGE_COPY_PATH" ]]; then
+        local mac_path tmp_img
+        mac_path=$(ssh_run "$MACOS_IMAGE_COPY_PATH -o /tmp/clipboard_pull_$$.png >/dev/null && echo /tmp/clipboard_pull_$$.png" || true)
+        if [[ -n "$mac_path" ]] && [[ "$mac_path" == /tmp/* ]]; then
+            tmp_img="$TEMP_DIR/sync_from.$$.png"
+            if scp_from "$mac_path" "$tmp_img" && [[ -s "$tmp_img" ]]; then
+                ssh_run "rm -f $mac_path" || true
+                if apply_image_to_linux "$tmp_img"; then
+                    with_lock write_image_hash "$(get_image_hash "$tmp_img")"
+                    rm -f "$tmp_img"
+                    notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+                    echo "Image synced from macOS"
+                    return 0
+                fi
             fi
-        else
-            [[ -n "$tmp_mac_img" ]] && rm -f "$tmp_mac_img"
+            rm -f "$tmp_img"
+            ssh_run "rm -f $mac_path" || true
         fi
     fi
 
-    # Fall back to text
     if [[ "$ENABLE_TEXT" == "true" ]]; then
         local mac_text
-        mac_text=$(pull_text_from_macos)
-
+        mac_text=$(ssh_run "export LC_CTYPE=en_US.UTF-8; pbpaste" || true)
         if [[ ${#mac_text} -ge $MIN_LENGTH ]]; then
             mac_text=$(ensure_utf8 "$mac_text")
-            if printf '%s' "$mac_text" | timeout 2 wl-copy -t text/plain 2>/dev/null; then
+            if apply_text_to_linux "$mac_text"; then
+                with_lock write_text_hash "$(get_text_hash "$mac_text")"
                 notify_linux "Clipboard Sync" "$mac_text"
                 echo "Text synced from macOS (${#mac_text} chars)"
                 return 0
-            else
-                echo "Error: failed to copy text to Linux clipboard" >&2
-                return 1
             fi
+            echo "Error: failed to copy text to Linux clipboard" >&2
+            return 1
         fi
     fi
 
@@ -958,94 +954,109 @@ cmd_sync_from() {
     return 0
 }
 
-# === USAGE ===
-
 show_usage() {
     cat << 'EOF'
 Usage: clipboard-sync [COMMAND]
 
 Commands:
-  (none)     Run in continuous polling daemon mode
-  sync-to    Push Linux clipboard to macOS (one-shot, auto-detect type)
-  sync-from  Pull macOS clipboard to Linux (one-shot, auto-detect type)
+  (none)     Run push-oriented daemon (parallel inbound + outbound workers)
+  sync-to    Push Linux clipboard to macOS (one-shot)
+  sync-from  Pull macOS clipboard to Linux (one-shot)
 
 Options:
-  -h, --help  Show this help message
+  -h, --help  Show this help
 
 Configuration: ~/.config/clipboard-sync/config.ini
-State:        ~/.local/state/clipboard-sync/
+State:         ~/.local/state/clipboard-sync/
 
-Examples:
-  clipboard-sync              # Start continuous sync daemon
-  clipboard-sync sync-to      # Immediately push Linux clipboard to macOS
-  clipboard-sync sync-from    # Immediately pull macOS clipboard to Linux
+Push architecture:
+  Linux watches Wayland and pushes over SSH ControlMaster.
+  macOS clipboard-sync-daemon pushes TEXT:/IMGFILE: events on a FIFO;
+  Linux applies payloads immediately (no second SSH pull for text).
 
-Keyboard shortcut examples (for sway/i3/hyprland):
-  bindsym $mod+Shift+c exec clipboard-sync sync-to
-  bindsym $mod+Shift+v exec clipboard-sync sync-from
+Set DEBUG=true for verbose logs. journalctl --user -u clipboard-sync -f
 EOF
 }
 
-# === MAIN LOOP ===
-
+# === DAEMON SUPERVISOR ===
 run_daemon() {
     setup
 
-    # Establish SSH master connection for multiplexing
     if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
-        echo "Establishing SSH master connection..."
         if ensure_ssh_master; then
-            echo "SSH multiplexing enabled (persist: ${SSH_MUX_PERSIST}s)"
+            log_info "SSH multiplexing ready (persist ${SSH_MUX_PERSIST}s)"
         else
-            echo "Warning: SSH multiplexing setup failed, falling back to direct connections"
+            log_warn "SSH multiplexing failed; direct connections (higher latency)"
             SSH_MUX_ENABLED="false"
         fi
     fi
 
-    log_info "Clipboard sync started (Linux ←→ macOS)"
+    log_info "Clipboard sync v2 push daemon"
     log_info "Remote: $REMOTE_USER@$REMOTE_HOST"
-    log_info "Config: $CONFIG_FILE"
-    log_info "State: $STATE_DIR"
-    log_info "Text sync: $ENABLE_TEXT"
-    log_info "Image sync: $ENABLE_IMAGE"
-    log_info "Polling interval: ${POLL_INTERVAL}s"
+    log_info "Mode: macos_event_mode=$MACOS_EVENT_MODE  text=$ENABLE_TEXT  image=$ENABLE_IMAGE"
 
-    local use_watch=false
-    if wayland_watch_available && start_wayland_watchers; then
-        use_watch=true
-        log_info "Using Wayland event-driven monitoring"
+    # Export config for subshells that call functions (same bash process via background jobs
+    # inherit functions when we use job control in this script — we start workers as
+    # background functions in this shell.)
+
+    # Outbound worker
+    if wayland_watch_available; then
+        run_outbound_watch_worker &
+        OUTBOUND_PID=$!
     else
-        log_info "Using polling mode for Linux clipboard"
+        run_outbound_poll_worker &
+        OUTBOUND_PID=$!
     fi
+    log_info "Outbound worker pid=$OUTBOUND_PID"
 
-    if macos_fifo_available && start_macos_fifo_reader; then
-        log_info "Using macOS FIFO event-driven monitoring"
-    fi
-
-    if $use_watch; then
-        run_watch_loop || run_polling_loop
+    # Inbound worker
+    if [[ "$MACOS_EVENT_MODE" == "fifo" ]]; then
+        run_inbound_fifo_worker &
+        INBOUND_PID=$!
+        run_safety_net_worker &
+        SAFETY_PID=$!
+        log_info "Inbound FIFO worker pid=$INBOUND_PID safety=$SAFETY_PID"
     else
-        run_polling_loop
+        run_inbound_poll_worker &
+        INBOUND_PID=$!
+        log_info "Inbound poll worker pid=$INBOUND_PID"
     fi
+
+    # Supervise: if a critical worker dies, exit so systemd restarts us
+    while true; do
+        if ! kill -0 "$OUTBOUND_PID" 2>/dev/null; then
+            log_error "Outbound worker died"
+            wait "$OUTBOUND_PID" 2>/dev/null || true
+            exit 1
+        fi
+        if ! kill -0 "$INBOUND_PID" 2>/dev/null; then
+            log_error "Inbound worker died"
+            wait "$INBOUND_PID" 2>/dev/null || true
+            exit 1
+        fi
+        if [[ -n "$SAFETY_PID" ]] && ! kill -0 "$SAFETY_PID" 2>/dev/null; then
+            log_warn "Safety-net worker died; restarting"
+            run_safety_net_worker &
+            SAFETY_PID=$!
+        fi
+        # Refresh mux periodically
+        ensure_ssh_master || log_warn "SSH master refresh failed"
+        sleep 5
+    done
 }
 
 main() {
-    # Parse configuration
     parse_config "$CONFIG_FILE" || true
 
     case "${1:-}" in
         sync-to)
-            # Don't register cleanup for one-shot commands - keep master connection alive
-            mkdir -p "$TEMP_DIR"
-            chmod 700 "$TEMP_DIR" 2>/dev/null || true
+            setup
             validate_config || exit 1
             cmd_sync_to
             exit $?
             ;;
         sync-from)
-            # Don't register cleanup for one-shot commands - keep master connection alive
-            mkdir -p "$TEMP_DIR"
-            chmod 700 "$TEMP_DIR" 2>/dev/null || true
+            setup
             validate_config || exit 1
             cmd_sync_from
             exit $?
@@ -1055,7 +1066,6 @@ main() {
             exit 0
             ;;
         "")
-            # Daemon mode (default, backward compatible)
             trap cleanup EXIT
             trap handle_shutdown INT TERM
             validate_config || exit 1
