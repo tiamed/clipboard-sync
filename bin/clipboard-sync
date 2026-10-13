@@ -730,10 +730,22 @@ handle_fifo_line() {
 
 run_inbound_fifo_worker() {
     log_info "Inbound worker: Mac FIFO push stream ($MACOS_EVENT_FIFO)"
+    local backoff=1
+    local max_backoff=60
+    # Remote probe + stream. Exit 2 = FIFO missing (daemon not running / not installed).
+    local remote_fifo_cmd
+    remote_fifo_cmd="if [ ! -p '$MACOS_EVENT_FIFO' ]; then
+  echo \"FIFO missing at $MACOS_EVENT_FIFO — start clipboard-sync-daemon on Mac (launchctl load ~/Library/LaunchAgents/clipboard-sync.daemon.plist), or set macos_event_mode=polling on Linux\" >&2
+  exit 2
+fi
+cat '$MACOS_EVENT_FIFO'"
+
     while true; do
         if ! ensure_ssh_master; then
-            log_error "inbound: SSH master down; retry in 3s"
-            sleep 3
+            log_error "inbound: SSH master down; retry in ${backoff}s"
+            sleep "$backoff"
+            backoff=$(( backoff * 2 ))
+            [[ $backoff -gt $max_backoff ]] && backoff=$max_backoff
             continue
         fi
 
@@ -742,35 +754,48 @@ run_inbound_fifo_worker() {
         : > "$errf"
 
         # Long-lived SSH that streams FIFO events with payload.
-        # Prefer mux ControlPath; reopen on disconnect.
+        # Guard pipeline: with set -euo pipefail an unguarded failed ssh|while
+        # would kill this worker (and used to take down the whole daemon).
+        local rc=0
+        set +e
         if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
             socket=$(get_ssh_socket)
             # shellcheck disable=SC2086
             ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-                "test -p '$MACOS_EVENT_FIFO' || { echo 'FIFO missing: start clipboard-sync-daemon on Mac' >&2; exit 2; }; cat '$MACOS_EVENT_FIFO'" \
+                "$remote_fifo_cmd" \
                 2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
                     handle_fifo_line "$line"
                 done
+            rc=${PIPESTATUS[0]:-1}
         else
             # shellcheck disable=SC2086
             ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
-                "test -p '$MACOS_EVENT_FIFO' || { echo 'FIFO missing: start clipboard-sync-daemon on Mac' >&2; exit 2; }; cat '$MACOS_EVENT_FIFO'" \
+                "$remote_fifo_cmd" \
                 2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
                     handle_fifo_line "$line"
                 done
+            rc=${PIPESTATUS[0]:-1}
         fi
+        set -euo pipefail
 
-        local rc=${PIPESTATUS[0]:-1}
         local err
         err=$(tr '\n' ' ' < "$errf" 2>/dev/null || true)
         if [[ $rc -eq 2 ]] || [[ "$err" == *"FIFO missing"* ]]; then
-            log_error "Mac FIFO not found at $MACOS_EVENT_FIFO — install/start clipboard-sync-daemon on macOS"
-            sleep 5
+            log_error "Mac FIFO unavailable at $MACOS_EVENT_FIFO (clipboard-sync-daemon not running?). Outbound keeps working; inbound will retry in ${backoff}s. Fix: start Mac daemon, or set macos_event_mode=polling.${err:+ Detail: $err}"
+        elif [[ $rc -ne 0 ]]; then
+            log_warn "inbound FIFO stream ended (rc=$rc); reconnecting in ${backoff}s${err:+ — $err}"
         else
-            log_warn "inbound FIFO stream ended (rc=$rc); reconnecting in 1s${err:+ — $err}"
-            sleep 1
+            log_warn "inbound FIFO stream closed; reconnecting in ${backoff}s${err:+ — $err}"
+            backoff=1
         fi
-        # Re-establish mux if needed
+
+        sleep "$backoff"
+        if [[ $rc -ne 0 ]]; then
+            backoff=$(( backoff * 2 ))
+            [[ $backoff -gt $max_backoff ]] && backoff=$max_backoff
+        else
+            backoff=1
+        fi
         ensure_ssh_master || true
     done
 }
@@ -1022,7 +1047,11 @@ run_daemon() {
         log_info "Inbound poll worker pid=$INBOUND_PID"
     fi
 
-    # Supervise: if a critical worker dies, exit so systemd restarts us
+    # Supervise workers. Outbound death is fatal (systemd restarts us).
+    # Inbound / safety death must NOT tear down the daemon — reconnect with backoff
+    # so Linux→Mac keeps working when Mac FIFO/daemon is missing.
+    local inbound_backoff=1
+    local inbound_max_backoff=60
     while true; do
         if ! kill -0 "$OUTBOUND_PID" 2>/dev/null; then
             log_error "Outbound worker died"
@@ -1030,9 +1059,20 @@ run_daemon() {
             exit 1
         fi
         if ! kill -0 "$INBOUND_PID" 2>/dev/null; then
-            log_error "Inbound worker died"
             wait "$INBOUND_PID" 2>/dev/null || true
-            exit 1
+            log_error "Inbound worker exited; restarting in ${inbound_backoff}s (outbound + safety poll keep running). If this repeats: start Mac clipboard-sync-daemon, or set macos_event_mode=polling"
+            sleep "$inbound_backoff"
+            inbound_backoff=$(( inbound_backoff * 2 ))
+            [[ $inbound_backoff -gt $inbound_max_backoff ]] && inbound_backoff=$inbound_max_backoff
+            if [[ "$MACOS_EVENT_MODE" == "fifo" ]]; then
+                run_inbound_fifo_worker &
+            else
+                run_inbound_poll_worker &
+            fi
+            INBOUND_PID=$!
+            log_info "Inbound worker restarted pid=$INBOUND_PID"
+        else
+            inbound_backoff=1
         fi
         if [[ -n "$SAFETY_PID" ]] && ! kill -0 "$SAFETY_PID" 2>/dev/null; then
             log_warn "Safety-net worker died; restarting"

@@ -93,7 +93,16 @@ mux_persist = 600
 3. Raise `poll_interval` to `30` (it is only a safety net now).
 4. `systemctl --user restart clipboard-sync`
 
-Old `macos_event_mode = polling` still works but will feel slow.
+### Without the Mac daemon (temporary)
+
+If you cannot compile/run `clipboard-sync-daemon` yet (e.g. Swift/SDK mismatch), keep Linux→Mac push and fall back Mac→Linux to polling:
+
+```ini
+macos_event_mode = polling
+poll_interval = 1
+```
+
+Then `systemctl --user restart clipboard-sync`. FIFO mode stays recommended once the Mac daemon is running; inbound FIFO failures no longer kill the Linux service (outbound keeps working and inbound retries with backoff).
 
 ## Commands
 
@@ -125,11 +134,36 @@ DEBUG=true clipboard-sync   # foreground verbose
 | Symptom | Check |
 |---------|--------|
 | Slow or silent | `journalctl --user -u clipboard-sync -n 80` — look for SSH / FIFO errors |
-| Mac → Linux never pushes | `ssh user@mac 'launchctl list \| grep clipboard-sync'`; FIFO must exist |
-| `FIFO missing` in logs | Re-run macOS installer / start LaunchAgent |
+| Mac → Linux never pushes | Mac daemon + FIFO (see below); or set `macos_event_mode = polling` |
+| `FIFO missing` / inbound retries | Start LaunchAgent on Mac, or use polling until daemon builds |
+| Linux → Mac still works, inbound retries | Expected when FIFO/daemon is down — not a full service crash |
 | Linux → Mac slow only | Ensure `mux_enabled = true` and master stays up (`ssh -O check`) |
 | No Wayland watch | Install original `wl-clipboard`; confirm `wl-paste --help \| grep watch` |
 | Echo / bounce | Hashes should prevent this; restart both sides if state is stale: `rm -f ~/.local/state/clipboard-sync/*_hash` |
+
+### Verify Mac FIFO / daemon
+
+On the Mac:
+
+```bash
+# LaunchAgent loaded?
+launchctl list | grep clipboard-sync
+
+# FIFO present?
+ls -l /tmp/clipboard-sync.fifo
+
+# Manual wake (Linux inbound should see a line if streaming):
+echo PING > /tmp/clipboard-sync.fifo
+
+# Daemon log:
+tail -f /tmp/clipboard-sync-daemon.log
+```
+
+From Linux:
+
+```bash
+ssh USER@MAC 'ls -l /tmp/clipboard-sync.fifo; launchctl list | grep clipboard-sync'
+```
 
 ## Uninstall
 

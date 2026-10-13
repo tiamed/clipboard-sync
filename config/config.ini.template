@@ -18,6 +18,7 @@ enable_image = true
 # Use wl-paste --watch for Linux → macOS (falls back to polling if unavailable)
 use_wayland_watch = true
 # macOS → Linux: fifo (push, recommended) or polling
+# Use polling temporarily if clipboard-sync-daemon is not installed on the Mac
 macos_event_mode = fifo
 # FIFO path must match clipboard-sync-daemon --fifo-path on the Mac
 macos_event_fifo = /tmp/clipboard-sync.fifo
