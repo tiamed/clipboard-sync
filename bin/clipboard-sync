@@ -732,13 +732,30 @@ run_inbound_fifo_worker() {
     log_info "Inbound worker: Mac FIFO push stream ($MACOS_EVENT_FIFO)"
     local backoff=1
     local max_backoff=60
-    # Remote probe + stream. Exit 2 = FIFO missing (daemon not running / not installed).
+    # Remote probe + line-buffered stream.
+    # Plain `cat` fully-buffers stdout when piped over SSH, so small TEXT lines
+    # can sit for seconds (often ~4–8KiB buffer) — the main Mac→Linux lag cause.
+    # Prefer stdbuf -oL, else perl ($|=1), else python3 -u. Exit 2 = FIFO missing.
     local remote_fifo_cmd
-    remote_fifo_cmd="if [ ! -p '$MACOS_EVENT_FIFO' ]; then
-  echo \"FIFO missing at $MACOS_EVENT_FIFO — start clipboard-sync-daemon on Mac (launchctl load ~/Library/LaunchAgents/clipboard-sync.daemon.plist), or set macos_event_mode=polling on Linux\" >&2
+    # shellcheck disable=SC2087
+    remote_fifo_cmd=$(cat <<EOF
+if [ ! -p '${MACOS_EVENT_FIFO}' ]; then
+  echo "FIFO missing at ${MACOS_EVENT_FIFO} — start clipboard-sync-daemon on Mac (launchctl load ~/Library/LaunchAgents/clipboard-sync.daemon.plist), or set macos_event_mode=polling on Linux" >&2
   exit 2
 fi
-cat '$MACOS_EVENT_FIFO'"
+if command -v stdbuf >/dev/null 2>&1; then
+  exec stdbuf -oL cat '${MACOS_EVENT_FIFO}'
+elif command -v perl >/dev/null 2>&1; then
+  exec perl -e '\$|=1; open my \$f, "<", \$ARGV[0] or die \$!; while (<\$f>) { print; }' '${MACOS_EVENT_FIFO}'
+else
+  exec python3 -u -c 'import sys; f=open(sys.argv[1]);
+while True:
+    line=f.readline()
+    if not line: break
+    sys.stdout.write(line); sys.stdout.flush()' '${MACOS_EVENT_FIFO}'
+fi
+EOF
+)
 
     while true; do
         if ! ensure_ssh_master; then
@@ -751,11 +768,15 @@ cat '$MACOS_EVENT_FIFO'"
 
         local socket=""
         local errf="$TEMP_DIR/fifo_stream.err"
+        local sawf="$TEMP_DIR/fifo_stream.saw"
         : > "$errf"
+        : > "$sawf"
 
         # Long-lived SSH that streams FIFO events with payload.
         # Guard pipeline: with set -euo pipefail an unguarded failed ssh|while
         # would kill this worker (and used to take down the whole daemon).
+        # Reset reconnect backoff when starting a live stream attempt.
+        backoff=1
         local rc=0
         set +e
         if [[ "$SSH_MUX_ENABLED" == "true" ]]; then
@@ -764,6 +785,7 @@ cat '$MACOS_EVENT_FIFO'"
             ssh -S "$socket" -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
                 "$remote_fifo_cmd" \
                 2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
+                    echo 1 > "$sawf"
                     handle_fifo_line "$line"
                 done
             rc=${PIPESTATUS[0]:-1}
@@ -772,6 +794,7 @@ cat '$MACOS_EVENT_FIFO'"
             ssh -T $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" \
                 "$remote_fifo_cmd" \
                 2>"$errf" | while IFS= read -r line || [[ -n "$line" ]]; do
+                    echo 1 > "$sawf"
                     handle_fifo_line "$line"
                 done
             rc=${PIPESTATUS[0]:-1}
@@ -780,17 +803,24 @@ cat '$MACOS_EVENT_FIFO'"
 
         local err
         err=$(tr '\n' ' ' < "$errf" 2>/dev/null || true)
+        local saw_data=0
+        [[ -s "$sawf" ]] && saw_data=1
         if [[ $rc -eq 2 ]] || [[ "$err" == *"FIFO missing"* ]]; then
             log_error "Mac FIFO unavailable at $MACOS_EVENT_FIFO (clipboard-sync-daemon not running?). Outbound keeps working; inbound will retry in ${backoff}s. Fix: start Mac daemon, or set macos_event_mode=polling.${err:+ Detail: $err}"
         elif [[ $rc -ne 0 ]]; then
             log_warn "inbound FIFO stream ended (rc=$rc); reconnecting in ${backoff}s${err:+ — $err}"
         else
             log_warn "inbound FIFO stream closed; reconnecting in ${backoff}s${err:+ — $err}"
+        fi
+
+        # Successful traffic keeps reconnect snappy; only grow backoff when the
+        # stream never delivered data (missing FIFO / hard SSH failures).
+        if [[ $saw_data -eq 1 ]]; then
             backoff=1
         fi
 
         sleep "$backoff"
-        if [[ $rc -ne 0 ]]; then
+        if [[ $saw_data -eq 0 && $rc -ne 0 ]]; then
             backoff=$(( backoff * 2 ))
             [[ $backoff -gt $max_backoff ]] && backoff=$max_backoff
         else

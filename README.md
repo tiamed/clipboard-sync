@@ -9,7 +9,7 @@ Linux                          SSH ControlMaster                    macOS
 ─────                          ─────────────────                    ─────
 wl-paste --watch ──► outbound worker ──► pbcopy / imagecopy
                                               ▲
-wl-copy ◄── inbound worker ◄── cat FIFO ◄── clipboard-sync-daemon
+wl-copy ◄── inbound worker ◄── line-buffered FIFO ◄── clipboard-sync-daemon
              (apply TEXT:/IMGFILE: payload)     (NSPasteboard → push)
 ```
 
@@ -134,12 +134,25 @@ DEBUG=true clipboard-sync   # foreground verbose
 | Symptom | Check |
 |---------|--------|
 | Slow or silent | `journalctl --user -u clipboard-sync -n 80` — look for SSH / FIFO errors |
+| Mac → Linux ~seconds lag, Linux → Mac fast | Fixed in push-architecture: line-buffered FIFO over SSH + snappy Mac poll. Update Linux script **and** Mac `clipboard-sync-daemon` binary, then restart both. |
 | Mac → Linux never pushes | Mac daemon + FIFO (see below); or set `macos_event_mode = polling` |
 | `FIFO missing` / inbound retries | Start LaunchAgent on Mac, or use polling until daemon builds |
 | Linux → Mac still works, inbound retries | Expected when FIFO/daemon is down — not a full service crash |
 | Linux → Mac slow only | Ensure `mux_enabled = true` and master stays up (`ssh -O check`) |
 | No Wayland watch | Install original `wl-clipboard`; confirm `wl-paste --help \| grep watch` |
 | Echo / bounce | Hashes should prevent this; restart both sides if state is stale: `rm -f ~/.local/state/clipboard-sync/*_hash` |
+
+### Update Mac daemon from a release tag
+
+```bash
+TAG=v1.3.0-rc2   # use the tag that has clipboard-sync-daemon-x86_64
+curl -L -o ~/scripts/clipboard-sync-daemon \
+  https://github.com/tiamed/clipboard-sync/releases/download/$TAG/clipboard-sync-daemon-x86_64
+chmod +x ~/scripts/clipboard-sync-daemon
+launchctl kickstart -k gui/$(id -u)/clipboard-sync.daemon
+```
+
+Linux script-only fixes: `install -m 755 bin/clipboard-sync ~/.local/bin/clipboard-sync && systemctl --user restart clipboard-sync` (no new Mac binary needed unless Swift changed).
 
 ### Verify Mac FIFO / daemon
 

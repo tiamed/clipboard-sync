@@ -167,6 +167,8 @@ final class IPCChannel {
 
             if let writer = self.fifoWriter {
                 writer.write(payload)
+                // Best-effort; fsync on FIFOs often returns EINVAL — ignore.
+                _ = Darwin.fsync(writer.fileDescriptor)
             }
 
             var alive: [Int32] = []
@@ -186,10 +188,10 @@ final class IPCChannel {
     }
 }
 
-final class AdaptiveClipboardMonitor {
+final class ClipboardMonitor {
+    /// Fixed snappy interval — idle backoff made Mac→Linux feel multi-second after quiet periods.
+    private let pollInterval: TimeInterval = 0.1
     private var lastChangeCount = NSPasteboard.general.changeCount
-    private var currentInterval: TimeInterval = 0.15
-    private var idleCount = 0
     private let ipc: IPCChannel
     private let imagePath: String
     private var timer: Timer?
@@ -200,7 +202,7 @@ final class AdaptiveClipboardMonitor {
     }
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: false) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         RunLoop.main.run()
@@ -211,18 +213,7 @@ final class AdaptiveClipboardMonitor {
         let current = pb.changeCount
         if current != lastChangeCount {
             lastChangeCount = current
-            currentInterval = 0.15
-            idleCount = 0
             handleChange(pb)
-        } else {
-            idleCount += 1
-            if idleCount > 10 {
-                currentInterval = min(2.0, currentInterval * 1.4)
-            }
-        }
-
-        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: false) { [weak self] _ in
-            self?.tick()
         }
     }
 
@@ -280,6 +271,6 @@ NSSetUncaughtExceptionHandler { exception in
 
 let config = parseArguments()
 let ipc = IPCChannel(fifoPath: config.fifoPath, socketPath: config.socketPath)
-let monitor = AdaptiveClipboardMonitor(ipc: ipc, imagePath: config.imagePath)
+let monitor = ClipboardMonitor(ipc: ipc, imagePath: config.imagePath)
 log("INFO", "clipboard-sync-daemon started (push protocol TEXT/IMGFILE)")
 monitor.start()
