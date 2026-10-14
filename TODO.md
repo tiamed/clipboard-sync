@@ -1,23 +1,29 @@
-# Clipboard Sync - Future Improvements
+# Clipboard Sync — Next
 
-## Done in push-architecture
-
-- [x] Parallel inbound / outbound workers (no serial blocking)
-- [x] Mac FIFO events carry payload (`TEXT:` / `IMGFILE:`) applied on Linux
-- [x] Default `macos_event_mode = fifo`; poll is safety net
-- [x] SSH/scp failures logged instead of swallowed
-- [x] macOS installer installs + loads clipboard-sync-daemon
+Push-architecture has shipped (parallel workers, FIFO payloads, default `macos_event_mode = fifo`, SSH failure logging, macOS daemon install). It is not tracked below.
 
 ## Next
 
-### Optional: replace SSH payload path with WebSocket relay
-- Persistent encrypted channel without SSH process overhead
-- Multi-device topology
-- See CrossPaste / ClipCascade
+- [x] Substitute `{{INSTALL_PREFIX}}` (and the FIFO / image-path tokens) before `launchctl load`. A raw plist template makes launchd exit **EX_CONFIG (78)** and the Mac daemon never starts.
+- [x] Bump `softprops/action-gh-release` to **v2** so `make_latest` is honored. v1 accepts the input and ignores it, so release candidates only stayed off Latest via `prerelease: true`. Hyphenated tags stay prerelease and `make_latest: false`; stable tags are `make_latest: true`.
+- [x] README daemon download example uses `v1.3.0` (or the latest stable release), not `v1.3.0-rc2`.
+- [x] Post-install self-check: FIFO exists, LaunchAgent status is not EX_CONFIG, daemon process is running, plus a one-shot TEXT round-trip hint. Linux installers reject a unit that still contains `{{...}}` and confirm the binary is present.
 
-### Optional: inbound SET FIFO on Mac
-- Linux writes `SET_TEXT:` into a Mac-side FIFO over SSH instead of `pbcopy`
-- Marginal gain once ControlMaster is warm
+### Optional later
 
-### Wayland
-- Direct wlr-data-control / ext-data-control client if `wl-paste --watch` unavailable
+- [ ] End-to-end smoke script (text push/pull against a fake Mac FIFO).
+- [ ] Clearer logs when a large clipboard or image transfer fails.
+
+## Not now
+
+### WebSocket relay
+
+Do not replace SSH unless we need more than two devices. A persistent relay is extra infrastructure; ControlMaster already covers the two-host case.
+
+### Mac inbound SET FIFO
+
+Linux writing `SET_TEXT:` into a Mac-side FIFO instead of `pbcopy` is a marginal gain once ControlMaster is warm.
+
+### Wayland protocol client
+
+A direct wlr-data-control / ext-data-control client is low priority unless `wl-paste --watch` is missing. Prefer the original `wl-clipboard` package.

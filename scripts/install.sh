@@ -34,7 +34,7 @@ log_warn() {
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 check_command() {
@@ -149,6 +149,52 @@ EOF
     log_success "Created state directory: $state_dir"
 }
 
+# Bash treats "&" in a ${var//pat/repl} replacement as "the matched text".
+escape_repl() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//&/\\&}"
+    printf '%s' "$s"
+}
+
+# Substitute {{INSTALL_PREFIX}} and refuse to install a unit that still
+# contains {{...}}. A raw template would point ExecStart at a path that
+# does not exist.
+render_systemd_unit() {
+    local dest="$1"
+    local template="${2:-$SCRIPT_DIR/systemd/clipboard-sync.service.template}"
+    local content rendered tmp prefix
+
+    if [[ ! -f "$template" ]]; then
+        log_error "systemd template not found: $template"
+        return 1
+    fi
+    if [[ -z "$PREFIX" ]]; then
+        log_error "PREFIX is empty; refusing to write systemd unit"
+        return 1
+    fi
+
+    content="$(cat "$template")"
+    prefix="$(escape_repl "$PREFIX")"
+    rendered="${content//\{\{INSTALL_PREFIX\}\}/${prefix}}"
+    tmp="$(mktemp)"
+    printf '%s\n' "$rendered" > "$tmp"
+
+    if grep -q '{{' "$tmp"; then
+        log_error "systemd unit still contains unsubstituted {{placeholders}}."
+        log_error "Refusing to install $dest"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! grep -F -q "ExecStart=${PREFIX}/bin/clipboard-sync" "$tmp"; then
+        log_error "systemd unit is missing ExecStart=${PREFIX}/bin/clipboard-sync"
+        rm -f "$tmp"
+        return 1
+    fi
+    mkdir -p "$(dirname "$dest")"
+    mv "$tmp" "$dest"
+}
+
 install_systemd() {
     local service_name="clipboard-sync"
     local service_file="$HOME/.config/systemd/user/$service_name.service"
@@ -158,10 +204,7 @@ install_systemd() {
     # Create systemd directory
     mkdir -p "$HOME/.config/systemd/user"
     
-    # Generate service file from template
-    sed "s|{{INSTALL_PREFIX}}|$PREFIX|g" \
-        "$SCRIPT_DIR/systemd/clipboard-sync.service.template" \
-        > "$service_file"
+    render_systemd_unit "$service_file"
     
     log_success "Created service file: $service_file"
     
@@ -169,6 +212,39 @@ install_systemd() {
     systemctl --user daemon-reload
     
     log_success "Systemd daemon reloaded"
+}
+
+post_install_check() {
+    local service_file="$HOME/.config/systemd/user/clipboard-sync.service"
+    local failed=0
+
+    if [[ -x "$PREFIX/bin/clipboard-sync" ]]; then
+        log_success "Binary present: $PREFIX/bin/clipboard-sync"
+    else
+        log_error "Binary missing or not executable: $PREFIX/bin/clipboard-sync"
+        failed=1
+    fi
+
+    if [[ -f "$service_file" ]] && ! grep -q '{{' "$service_file"; then
+        log_success "systemd unit has no unsubstituted placeholders"
+    else
+        log_error "systemd unit missing or still contains {{placeholders}}: $service_file"
+        failed=1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active clipboard-sync >/dev/null 2>&1; then
+            log_success "clipboard-sync service is active"
+        else
+            log_info "clipboard-sync service is not active yet (edit config.ini, then systemctl --user enable --now clipboard-sync)"
+        fi
+    fi
+
+    if [[ "$failed" -ne 0 ]]; then
+        log_error "Post-install self-check failed"
+        return 1
+    fi
+    log_success "Post-install self-check passed"
 }
 
 enable_service() {
@@ -250,9 +326,13 @@ main() {
     
     # Enable service
     enable_service
+
+    post_install_check
     
     # Print summary
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
