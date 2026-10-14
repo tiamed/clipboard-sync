@@ -1,32 +1,26 @@
 #!/usr/bin/env swift
 //
 // clipboard-sync-daemon
-// macOS clipboard event daemon for clipboard-sync.
+// macOS clipboard event daemon for clipboard-sync (push architecture).
 //
-// Watches NSPasteboard for text/image changes using an adaptive polling
-// interval and pushes events to a Unix domain socket or FIFO so the Linux
-// bash process can react immediately instead of polling.
+// Watches NSPasteboard and pushes events to a FIFO (and optional Unix socket)
+// so the Linux side can apply content immediately:
+//   TEXT:<base64>
+//   IMGFILE:/tmp/clipboard-sync-push.png
 //
 // Usage:
 //   clipboard-sync-daemon [--fifo-path <path>] [--socket-path <path>]
+//                         [--image-path <path>]
 //
-// Defaults:
-//   --fifo-path   /tmp/clipboard-sync.fifo
-//   --socket-path (none; socket mode disabled by default)
-//
-// Events are written as newline-delimited plain text:
-//   TEXT:<base64>
-//   IMG:<base64>
 
 import AppKit
 import Foundation
 import Darwin
 
-// MARK: - Configuration
-
 struct Config {
     var fifoPath: String = "/tmp/clipboard-sync.fifo"
     var socketPath: String? = nil
+    var imagePath: String = "/tmp/clipboard-sync-push.png"
 }
 
 func parseArguments() -> Config {
@@ -37,14 +31,13 @@ func parseArguments() -> Config {
         switch arg {
         case "--fifo-path":
             i += 1
-            if i < CommandLine.arguments.count {
-                config.fifoPath = CommandLine.arguments[i]
-            }
+            if i < CommandLine.arguments.count { config.fifoPath = CommandLine.arguments[i] }
         case "--socket-path":
             i += 1
-            if i < CommandLine.arguments.count {
-                config.socketPath = CommandLine.arguments[i]
-            }
+            if i < CommandLine.arguments.count { config.socketPath = CommandLine.arguments[i] }
+        case "--image-path":
+            i += 1
+            if i < CommandLine.arguments.count { config.imagePath = CommandLine.arguments[i] }
         case "-h", "--help":
             printUsage()
             exit(0)
@@ -59,19 +52,16 @@ func parseArguments() -> Config {
 func printUsage() {
     print("Usage: clipboard-sync-daemon [options]")
     print("Options:")
-    print("  --fifo-path <path>     Path to the event FIFO (default: /tmp/clipboard-sync.fifo)")
-    print("  --socket-path <path>   Also listen on a Unix domain socket at <path>")
+    print("  --fifo-path <path>     Event FIFO (default: /tmp/clipboard-sync.fifo)")
+    print("  --socket-path <path>   Also broadcast on a Unix domain socket")
+    print("  --image-path <path>    Where to write PNG for IMGFILE events")
     print("  -h, --help             Show this help")
 }
-
-// MARK: - Logging
 
 func log(_ level: String, _ message: String) {
     let ts = ISO8601DateFormatter().string(from: Date())
     FileHandle.standardError.write(Data("[\(ts)] [\(level)] \(message)\n".utf8))
 }
-
-// MARK: - IPC
 
 final class IPCChannel {
     private let fifoPath: String
@@ -88,20 +78,15 @@ final class IPCChannel {
     }
 
     private func setupFIFO() {
-        // Check if file exists and verify ownership before removing.
-        // This prevents TOCTOU attacks where an attacker creates a symlink.
         if FileManager.default.fileExists(atPath: fifoPath) {
             do {
                 let attrs = try FileManager.default.attributesOfItem(atPath: fifoPath)
                 let fileOwner = attrs[.ownerAccountID] as? NSNumber
                 let currentUser = getuid()
-
                 if fileOwner?.uint32Value != currentUser {
                     log("ERROR", "FIFO exists but is not owned by current user - refusing to remove")
                     return
                 }
-
-                // Safe to remove since we own it
                 try FileManager.default.removeItem(atPath: fifoPath)
             } catch {
                 log("ERROR", "Failed to check/remove existing FIFO: \(error)")
@@ -115,8 +100,7 @@ final class IPCChannel {
             return
         }
 
-        // Open the FIFO for both reading and writing so the daemon always has
-        // a reader. This prevents writes from blocking when no client is connected.
+        // O_RDWR so writes never block when no Linux reader is attached yet.
         let fd = open(fifoPath, O_RDWR | O_NONBLOCK)
         if fd < 0 {
             log("ERROR", "failed to open FIFO: \(errno)")
@@ -183,6 +167,8 @@ final class IPCChannel {
 
             if let writer = self.fifoWriter {
                 writer.write(payload)
+                // Best-effort; fsync on FIFOs often returns EINVAL — ignore.
+                _ = Darwin.fsync(writer.fileDescriptor)
             }
 
             var alive: [Int32] = []
@@ -202,21 +188,21 @@ final class IPCChannel {
     }
 }
 
-// MARK: - Clipboard monitor
-
-final class AdaptiveClipboardMonitor {
+final class ClipboardMonitor {
+    /// Fixed snappy interval — idle backoff made Mac→Linux feel multi-second after quiet periods.
+    private let pollInterval: TimeInterval = 0.1
     private var lastChangeCount = NSPasteboard.general.changeCount
-    private var currentInterval: TimeInterval = 0.2
-    private var idleCount = 0
     private let ipc: IPCChannel
+    private let imagePath: String
     private var timer: Timer?
 
-    init(ipc: IPCChannel) {
+    init(ipc: IPCChannel, imagePath: String) {
         self.ipc = ipc
+        self.imagePath = imagePath
     }
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: false) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         RunLoop.main.run()
@@ -227,42 +213,55 @@ final class AdaptiveClipboardMonitor {
         let current = pb.changeCount
         if current != lastChangeCount {
             lastChangeCount = current
-            currentInterval = 0.2
-            idleCount = 0
             handleChange(pb)
-        } else {
-            idleCount += 1
-            if idleCount > 10 {
-                currentInterval = min(5.0, currentInterval * 1.5)
-            }
-        }
-
-        timer = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: false) { [weak self] _ in
-            self?.tick()
         }
     }
 
     private func handleChange(_ pb: NSPasteboard) {
-        // Prefer text; if no text, try to capture an image as PNG.
-        if let text = pb.string(forType: .string) {
+        // Prefer text when present (common for mixed pasteboards).
+        if let text = pb.string(forType: .string), !text.isEmpty {
             let b64 = Data(text.utf8).base64EncodedString()
             let payload = "TEXT:\(b64)"
             ipc.broadcast(event: Data(payload.utf8))
+            log("INFO", "pushed TEXT (\(text.utf8.count) bytes)")
             return
         }
 
-        if let data = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
-            let b64 = data.base64EncodedString()
-            let payload = "IMG:\(b64)"
-            ipc.broadcast(event: Data(payload.utf8))
+        // Images: write PNG to a stable path and signal IMGFILE (avoids huge FIFO lines).
+        if let png = pngData(from: pb) {
+            do {
+                try png.write(to: URL(fileURLWithPath: imagePath), options: .atomic)
+                let payload = "IMGFILE:\(imagePath)"
+                ipc.broadcast(event: Data(payload.utf8))
+                log("INFO", "pushed IMGFILE \(imagePath) (\(png.count) bytes)")
+            } catch {
+                log("ERROR", "failed to write image: \(error)")
+            }
             return
         }
 
         log("DEBUG", "clipboard changed but no supported content")
     }
-}
 
-// MARK: - Entry point
+    private func pngData(from pb: NSPasteboard) -> Data? {
+        if let data = pb.data(forType: .png) {
+            return data
+        }
+        if let tiff = pb.data(forType: .tiff),
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return png
+        }
+        if let objects = pb.readObjects(forClasses: [NSImage.self], options: nil),
+           let img = objects.first as? NSImage,
+           let tiff = img.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return png
+        }
+        return nil
+    }
+}
 
 NSSetUncaughtExceptionHandler { exception in
     log("ERROR", "Uncaught exception: \(exception)")
@@ -272,5 +271,6 @@ NSSetUncaughtExceptionHandler { exception in
 
 let config = parseArguments()
 let ipc = IPCChannel(fifoPath: config.fifoPath, socketPath: config.socketPath)
-let monitor = AdaptiveClipboardMonitor(ipc: ipc)
+let monitor = ClipboardMonitor(ipc: ipc, imagePath: config.imagePath)
+log("INFO", "clipboard-sync-daemon started (push protocol TEXT/IMGFILE)")
 monitor.start()

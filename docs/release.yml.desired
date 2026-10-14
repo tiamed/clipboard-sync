@@ -1,0 +1,94 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build helpers for ${{ matrix.arch }}
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            TARGET=arm64-apple-macosx11.0
+          else
+            TARGET=x86_64-apple-macosx11.0
+          fi
+          swiftc -target "$TARGET" macos/imagecopy.swift -o "imagecopy-${{ matrix.arch }}"
+          swiftc -target "$TARGET" macos/clipboard-sync-daemon.swift -o "clipboard-sync-daemon-${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            imagecopy-${{ matrix.arch }}
+            clipboard-sync-daemon-${{ matrix.arch }}
+
+  release:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release assets
+        run: |
+          mkdir -p release
+          mv artifacts/macos-arm64/imagecopy-arm64 release/
+          mv artifacts/macos-arm64/clipboard-sync-daemon-arm64 release/
+          mv artifacts/macos-x86_64/imagecopy-x86_64 release/
+          mv artifacts/macos-x86_64/clipboard-sync-daemon-x86_64 release/
+          chmod +x release/*
+
+      - name: Create SHA256 checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=v0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: Clipboard Sync ${{ steps.version.outputs.VERSION }}
+          files: release/*
+          body: |
+            ## Push architecture
+
+            Near-instant bidirectional sync: Wayland watch + macOS FIFO push over SSH ControlMaster.
+
+            ### Linux
+            ```bash
+            curl -sSL https://tiamed.github.io/clipboard-sync/install-linux.sh | bash
+            ```
+
+            ### macOS (daemon + imagecopy — required for push)
+            ```bash
+            curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
