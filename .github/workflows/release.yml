@@ -70,11 +70,26 @@ jobs:
             echo "VERSION=v0.0.0-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           fi
 
+      - name: Detect prerelease
+        id: meta
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          # Semver pre-releases have a hyphen (v1.3.0-rc2, -alpha, -beta, workflow_dispatch builds)
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.VERSION }}
           name: Clipboard Sync ${{ steps.version.outputs.VERSION }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          make_latest: ${{ steps.meta.outputs.make_latest }}
           files: release/*
           body: |
             ## Push architecture
