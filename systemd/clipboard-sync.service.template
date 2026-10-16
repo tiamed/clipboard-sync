@@ -1,15 +1,23 @@
 [Unit]
 Description=Clipboard sync between Linux and macOS
-After=network.target
+# graphical-session.target is started by GNOME, KDE, and uwsm once the
+# compositor is up. After= orders this service behind that target when the
+# desktop pulls it in. It is not required: WantedBy=default.target still
+# starts the service for Sway/Hyprland setups that never activate
+# graphical-session.target, and for a headless enable.
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart={{INSTALL_PREFIX}}/bin/clipboard-sync
 Restart=on-failure
 RestartSec=10
-Environment=DISPLAY=:0
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Session environment is substituted at install. WAYLAND_DISPLAY is written
+# only when a live socket (or an explicit WAYLAND_DISPLAY) is known.
+# XDG_RUNTIME_DIR uses the installing user, not a fixed uid.
+{{ENVIRONMENT_LINES}}
 
 [Install]
+WantedBy=graphical-session.target
 WantedBy=default.target

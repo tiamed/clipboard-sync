@@ -41,6 +41,8 @@ ssh-copy-id YOUR_USER@YOUR_MAC
 systemctl --user enable --now clipboard-sync
 ```
 
+Run the installer from the graphical session when you can. It records the live Wayland socket (often `wayland-1`). If none is visible, as with a typical SSH install, the unit leaves `WAYLAND_DISPLAY` unset.
+
 ### 3. Verify
 
 ```bash
@@ -143,6 +145,7 @@ DEBUG=true clipboard-sync   # foreground verbose
 | Linux → Mac still works, inbound retries | Expected when FIFO/daemon is down — not a full service crash |
 | Linux → Mac slow only | Ensure `mux_enabled = true` and master stays up (`ssh -O check`) |
 | No Wayland watch | Install original `wl-clipboard`; confirm `wl-paste --help \| grep watch` |
+| `Failed to connect to a Wayland server` | The unit's `WAYLAND_DISPLAY` does not match a socket in `$XDG_RUNTIME_DIR` (`wayland-1` is common). Re-run the Linux installer from the graphical session. If the unit has no `WAYLAND_DISPLAY` line, run `systemctl --user import-environment WAYLAND_DISPLAY DISPLAY && systemctl --user restart clipboard-sync`. GNOME, KDE, and uwsm start `graphical-session.target`, which this service waits for. Sway and Hyprland without that target still start it from `default.target`. |
 | Echo / bounce | Hashes should prevent this; restart both sides if state is stale: `rm -f ~/.local/state/clipboard-sync/*_hash` |
 
 ### Update Mac daemon from a release tag
