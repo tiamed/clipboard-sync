@@ -395,6 +395,7 @@ main() {
     echo ""
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# Executed directly, including `curl | bash` (no BASH_SOURCE). Skip when sourced.
+if [[ "${BASH_SOURCE[0]:-}" == "$0" || -z "${BASH_SOURCE[0]:-}" ]]; then
     main "$@"
 fi
