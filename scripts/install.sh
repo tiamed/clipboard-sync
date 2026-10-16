@@ -149,21 +149,14 @@ EOF
     log_success "Created state directory: $state_dir"
 }
 
-# Bash treats "&" in a ${var//pat/repl} replacement as "the matched text".
-escape_repl() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//&/\\&}"
-    printf '%s' "$s"
-}
-
-# Substitute {{INSTALL_PREFIX}} and refuse to install a unit that still
-# contains {{...}}. A raw template would point ExecStart at a path that
-# does not exist.
+# Substitute the unit template (prefix plus the live Wayland session) and
+# refuse to install a file that still contains {{...}}. "&" in the prefix is
+# escaped inside scripts/systemd-unit.sh; bash would otherwise treat it as
+# the matched text.
 render_systemd_unit() {
     local dest="$1"
     local template="${2:-$SCRIPT_DIR/systemd/clipboard-sync.service.template}"
-    local content rendered tmp prefix
+    local content rendered tmp
 
     if [[ ! -f "$template" ]]; then
         log_error "systemd template not found: $template"
@@ -174,9 +167,13 @@ render_systemd_unit() {
         return 1
     fi
 
-    content="$(cat "$template")"
-    prefix="$(escape_repl "$PREFIX")"
-    rendered="${content//\{\{INSTALL_PREFIX\}\}/${prefix}}"
+    if ! declare -F apply_clipboard_sync_unit_template >/dev/null 2>&1; then
+        # shellcheck disable=SC1091
+        source "$SCRIPT_DIR/scripts/systemd-unit.sh"
+    fi
+
+    content="$(<"$template")"
+    rendered="$(apply_clipboard_sync_unit_template "$PREFIX" "$content")" || return 1
     tmp="$(mktemp)"
     printf '%s\n' "$rendered" > "$tmp"
 
@@ -198,19 +195,18 @@ render_systemd_unit() {
 install_systemd() {
     local service_name="clipboard-sync"
     local service_file="$HOME/.config/systemd/user/$service_name.service"
-    
+
     log_info "Installing systemd service..."
-    
-    # Create systemd directory
+
     mkdir -p "$HOME/.config/systemd/user"
-    
+
     render_systemd_unit "$service_file"
-    
+    report_clipboard_sync_wayland_choice "$(<"$service_file")"
+
     log_success "Created service file: $service_file"
-    
-    # Reload systemd
+
     systemctl --user daemon-reload
-    
+
     log_success "Systemd daemon reloaded"
 }
 
@@ -333,6 +329,6 @@ main() {
     print_summary
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
     main "$@"
 fi
