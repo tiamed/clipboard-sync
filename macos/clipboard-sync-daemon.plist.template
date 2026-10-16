@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by macos/install-macos.sh. Do not launchctl load this file directly.
+     Tokens: INSTALL_PREFIX, FIFO_PATH, IMAGE_PATH. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -9,9 +11,9 @@
     <array>
         <string>{{INSTALL_PREFIX}}/clipboard-sync-daemon</string>
         <string>--fifo-path</string>
-        <string>/tmp/clipboard-sync.fifo</string>
+        <string>{{FIFO_PATH}}</string>
         <string>--image-path</string>
-        <string>/tmp/clipboard-sync-push.png</string>
+        <string>{{IMAGE_PATH}}</string>
     </array>
 
     <key>RunAtLoad</key>

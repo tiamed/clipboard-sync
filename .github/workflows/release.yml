@@ -83,8 +83,10 @@ jobs:
             echo "make_latest=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # v1 accepts make_latest and ignores it, so prereleases only stayed off
+      # GitHub "Latest" via prerelease:true. v2 passes make_latest through.
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.VERSION }}
           name: Clipboard Sync ${{ steps.version.outputs.VERSION }}

@@ -1,10 +1,12 @@
-# Release workflow update (needs `workflow` token scope)
+# Release workflow
 
-The PAT used for this PR lacked `workflow` scope, so `.github/workflows/release.yml` was left unchanged.
-After merge (or with a token that has `workflow`), update the release job to also build and publish:
+`.github/workflows/release.yml` is the workflow that runs on `v*` tags.
 
-- `clipboard-sync-daemon-arm64`
-- `clipboard-sync-daemon-x86_64`
+`softprops/action-gh-release` is **v2**. v1 accepts `make_latest` and ignores it, so a hyphenated tag only stayed off GitHub "Latest" when `prerelease: true` happened to be enough. v2 sends `make_latest` to the API.
 
-alongside the existing `imagecopy-*` binaries (same `swiftc -target` matrix as imagecopy).
-See the push-architecture branch history / PR description for the intended YAML.
+- Hyphenated tags (`v1.3.0-rc2`, `-alpha`, `-beta`, and `workflow_dispatch` builds `v0.0.0-<sha>`) set `prerelease: true` and `make_latest: false`.
+- Stable tags (`v1.3.0`) set `prerelease: false` and `make_latest: true`.
+
+Pushing `.github/workflows/` needs a token with the `workflow` scope. If that push is rejected, leave the in-repo workflow untouched, put the intended file in `docs/release.yml.desired`, and describe it in the PR. Do not force-push.
+
+`docs/release.yml.desired` matches the current workflow, including the v2 action.

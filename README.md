@@ -30,6 +30,8 @@ curl -sSL https://tiamed.github.io/clipboard-sync/install-macos.sh | bash
 
 Installs `~/scripts/imagecopy`, `~/scripts/clipboard-sync-daemon`, and a LaunchAgent.
 
+The installer substitutes `{{INSTALL_PREFIX}}`, `{{FIFO_PATH}}`, and `{{IMAGE_PATH}}` in `macos/clipboard-sync-daemon.plist.template` before `launchctl load`. It will not load a plist that still contains `{{...}}` (that leaves launchd in **EX_CONFIG / status 78** and the daemon never starts). After load it checks that the agent is running, that the status is not 78, and that `/tmp/clipboard-sync.fifo` exists, then prints a one-shot text hint (`clipboard-sync sync-to` / `sync-from` from Linux).
+
 ### 2. Linux
 
 ```bash
@@ -137,6 +139,7 @@ DEBUG=true clipboard-sync   # foreground verbose
 | Mac → Linux ~seconds lag, Linux → Mac fast | Fixed in push-architecture: line-buffered FIFO over SSH + snappy Mac poll. Update Linux script **and** Mac `clipboard-sync-daemon` binary, then restart both. |
 | Mac → Linux never pushes | Mac daemon + FIFO (see below); or set `macos_event_mode = polling` |
 | `FIFO missing` / inbound retries | Start LaunchAgent on Mac, or use polling until daemon builds |
+| LaunchAgent status **78** (`EX_CONFIG`) | Program path is missing or the plist still contains `{{INSTALL_PREFIX}}`. Re-run `install-macos.sh`. Do not `launchctl load` the `.template` file. |
 | Linux → Mac still works, inbound retries | Expected when FIFO/daemon is down — not a full service crash |
 | Linux → Mac slow only | Ensure `mux_enabled = true` and master stays up (`ssh -O check`) |
 | No Wayland watch | Install original `wl-clipboard`; confirm `wl-paste --help \| grep watch` |
@@ -145,12 +148,15 @@ DEBUG=true clipboard-sync   # foreground verbose
 ### Update Mac daemon from a release tag
 
 ```bash
-TAG=v1.3.0-rc2   # use the tag that has clipboard-sync-daemon-x86_64
+TAG=v1.3.0   # latest stable release; skip hyphenated prerelease tags (-rc, -alpha, -beta)
+ARCH=x86_64  # or arm64
 curl -L -o ~/scripts/clipboard-sync-daemon \
-  https://github.com/tiamed/clipboard-sync/releases/download/$TAG/clipboard-sync-daemon-x86_64
+  https://github.com/tiamed/clipboard-sync/releases/download/$TAG/clipboard-sync-daemon-$ARCH
 chmod +x ~/scripts/clipboard-sync-daemon
 launchctl kickstart -k gui/$(id -u)/clipboard-sync.daemon
 ```
+
+`TAG` can also be whatever the [latest stable release](https://github.com/tiamed/clipboard-sync/releases/latest) is. Re-running `install-macos.sh` is the usual path; it rewrites the LaunchAgent with a substituted program path and runs the post-install checks.
 
 Linux script-only fixes: `install -m 755 bin/clipboard-sync ~/.local/bin/clipboard-sync && systemctl --user restart clipboard-sync` (no new Mac binary needed unless Swift changed).
 

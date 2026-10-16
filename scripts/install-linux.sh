@@ -21,7 +21,60 @@ NC='\033[0m'
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+assert_no_placeholders() {
+    local file="$1"
+    local what="$2"
+    if [[ ! -f "$file" ]]; then
+        log_error "${what} was not written: $file"
+        return 1
+    fi
+    if grep -q '{{' "$file"; then
+        log_error "${what} still contains unsubstituted {{placeholders}}: $file"
+        log_error "Refusing to continue."
+        rm -f "$file"
+        return 1
+    fi
+}
+
+post_install_check() {
+    local service_file="$HOME/.config/systemd/user/clipboard-sync.service"
+    local failed=0
+
+    if [[ -x "$PREFIX/bin/clipboard-sync" ]]; then
+        log_success "Binary present: $PREFIX/bin/clipboard-sync"
+    else
+        log_error "Binary missing or not executable: $PREFIX/bin/clipboard-sync"
+        failed=1
+    fi
+
+    if assert_no_placeholders "$service_file" "systemd unit"; then
+        log_success "systemd unit has no unsubstituted placeholders"
+    else
+        failed=1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active clipboard-sync >/dev/null 2>&1; then
+            log_success "clipboard-sync service is active"
+        else
+            log_info "Service not started yet. Edit config.ini, then: systemctl --user enable --now clipboard-sync"
+        fi
+    fi
+
+    if [[ "$failed" -ne 0 ]]; then
+        log_error "Post-install self-check failed"
+        return 1
+    fi
+
+    echo ""
+    echo "One-shot text check (after the Mac daemon is running and SSH works):"
+    echo "  clipboard-sync sync-to"
+    echo "  clipboard-sync sync-from"
+    echo ""
+    log_success "Post-install self-check passed"
+}
 
 check_dependencies() {
     local missing=0
@@ -134,6 +187,10 @@ Environment=XDG_RUNTIME_DIR=$xdg_runtime_dir
 WantedBy=default.target
 EOF
     
+    if ! assert_no_placeholders "$service_file" "systemd unit"; then
+        return 1
+    fi
+
     log_success "Installed systemd service"
     
     systemctl --user daemon-reload
@@ -177,7 +234,10 @@ main() {
     download_files "$VERSION"
     setup_config
     install_systemd
+    post_install_check
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
