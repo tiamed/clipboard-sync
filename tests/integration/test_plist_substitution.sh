@@ -209,4 +209,25 @@ if [[ -f "$badf" ]]; then
 fi
 pass "linux installer rejects an unsubstituted unit"
 
+# Sourcing must not start an install. Executing the real guard — including
+# curl | bash, where BASH_SOURCE is unset — must call main.
+sourced_out="$(bash -c "source '$ROOT/macos/install-macos.sh'; printf 'SOURCED_ONLY\n'")"
+[[ "$sourced_out" == "SOURCED_ONLY" ]] || fail "sourcing install-macos.sh ran main: $sourced_out"
+python3 - "$ROOT/macos/install-macos.sh" "$TEST_HOME/piped-install.sh" << 'PY'
+import pathlib, sys
+src, dest = sys.argv[1:]
+text = pathlib.Path(src).read_text()
+old = 'main() {\n    echo ""\n'
+new = 'main() {\n    echo PIPED_MAIN_RAN\n    return 0\n    echo ""\n'
+if old not in text:
+    raise SystemExit("main() preamble not found")
+pathlib.Path(dest).write_text(text.replace(old, new, 1))
+PY
+chmod +x "$TEST_HOME/piped-install.sh"
+direct_out="$("$TEST_HOME/piped-install.sh")"
+[[ "$direct_out" == "PIPED_MAIN_RAN" ]] || fail "direct installer skipped main: $direct_out"
+piped_out="$(cat "$TEST_HOME/piped-install.sh" | bash)"
+[[ "$piped_out" == "PIPED_MAIN_RAN" ]] || fail "piped installer skipped main: $piped_out"
+pass "macOS installer main runs when piped to bash and not when sourced"
+
 echo "All plist/unit substitution checks passed"
