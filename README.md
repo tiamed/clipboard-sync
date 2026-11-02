@@ -15,8 +15,9 @@ wl-copy ◄── inbound worker ◄── line-buffered FIFO ◄── clipboar
 
 - **Two parallel workers** — Linux→Mac and Mac→Linux never block each other.
 - **Push, not poll** — Mac daemon writes `TEXT:<base64>` / `IMGFILE:/tmp/...` on a FIFO; Linux applies the payload (text has no second SSH round-trip; images scp once).
-- **Persistent SSH mux** — ControlMaster keeps latency low.
-- **Echo-loop safe** — shared content hashes + flock.
+- **Persistent SSH mux** — ControlMaster keeps latency low; a failed master is retried on the next event, not disabled for the daemon's lifetime.
+- **Echo-loop safe** — content hashes are claimed before the clipboard write, so `wl-paste --watch` cannot echo an inbound payload back to the Mac.
+- **Fast Mac events** — 50ms `NSPasteboard` poll with App Nap guarded; the FIFO is reused across daemon restarts, and transient empty pasteboard states are retried instead of dropped.
 - **Failures logged** — SSH/scp errors go to journald (not swallowed).
 - **Safety-net poll** — rare fallback if a push event is missed.
 
@@ -51,6 +52,28 @@ journalctl --user -u clipboard-sync -f
 clipboard-sync sync-to    # one-shot push
 clipboard-sync sync-from  # one-shot pull
 ```
+
+### If it still feels slow
+
+The link, not the clipboard tools, dominates. Measure:
+
+```bash
+# 1. Is ControlMaster actually up? A cold SSH handshake costs ~0.7-1.5s on Wi-Fi.
+ssh -O check -S ~/.cache/clipboard-sync/ssh-mux/* bo@YOUR_MAC
+
+# 2. RTT/jitter. Wired LAN is ~1-2ms; Wi-Fi is often 30-90ms with spikes.
+ping -c 20 YOUR_MAC
+
+# 3. Which path handled the event?
+journalctl --user -u clipboard-sync -o short-precise | grep -E '→|←'
+# [push] = FIFO, [poll] = safety net (should be rare)
+```
+
+- Put the Mac on Ethernet if possible. Linux→Mac still runs a remote `pbcopy`, and each remote process spawn plus RTT is visible on a busy Wi-Fi link.
+- Keep `mux_enabled = true`. A failed master is now retried; check `ssh -O check` if journald reports `SSH multiplexing failed`.
+- `poll_interval` is only the safety net. With `poll_interval = 1`, text is rechecked every 5s and images every 60s.
+- If the Mac is under memory pressure (`vm.swapusage`), process spawn and AppKit calls slow down; close apps or reboot.
+- Continuous screen-sharing/KVM traffic (for example Deskflow) on the same Wi-Fi adds airtime and jitter; wired Ethernet or QoS helps.
 
 ## Requirements
 
@@ -138,7 +161,9 @@ DEBUG=true clipboard-sync   # foreground verbose
 | Symptom | Check |
 |---------|--------|
 | Slow or silent | `journalctl --user -u clipboard-sync -n 80` — look for SSH / FIFO errors |
-| Mac → Linux ~seconds lag, Linux → Mac fast | Fixed in push-architecture: line-buffered FIFO over SSH + snappy Mac poll. Update Linux script **and** Mac `clipboard-sync-daemon` binary, then restart both. |
+| Still ~0.5–1s+ per copy | Check `ssh -O check` for the mux socket, `ping` RTT to the Mac, and the "If it still feels slow" section |
+| Mac copy shows up ~5s late | Daemon missed a transient pasteboard state or the FIFO stream reconnected; check `/tmp/clipboard-sync-daemon.log` for `reusing existing FIFO` / `no supported content` |
+| Mac → Linux ~seconds lag, Linux → Mac fast | Update both sides: the daemon now polls at 50ms, reuses the FIFO, and retries transient empty pasteboard states; hashes are claimed before `wl-copy` to stop echo storms. |
 | Mac → Linux never pushes | Mac daemon + FIFO (see below); or set `macos_event_mode = polling` |
 | `FIFO missing` / inbound retries | Start LaunchAgent on Mac, or use polling until daemon builds |
 | LaunchAgent status **78** (`EX_CONFIG`) | Program path is missing or the plist still contains `{{INSTALL_PREFIX}}`. Re-run `install-macos.sh`. Do not `launchctl load` the `.template` file. |

@@ -12,6 +12,7 @@ image_copy_path = /Users/YOUR_MAC_USERNAME/scripts/imagecopy
 # Minimum text length to sync
 min_length = 1
 # Safety-net poll interval in seconds (push mode uses this rarely; poll mode uses it as primary)
+# Text safety net is clamped to at least 5s; images are pulled every 60s.
 poll_interval = 30
 enable_text = true
 enable_image = true

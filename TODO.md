@@ -14,7 +14,18 @@ Push-architecture has shipped (parallel workers, FIFO payloads, default `macos_e
 - [ ] End-to-end smoke script (text push/pull against a fake Mac FIFO).
 - [ ] Clearer logs when a large clipboard or image transfer fails.
 
+## Latency pass (2026-11-02)
+
+- [x] Keep ControlMaster retrying after a failed start; one Mac-offline start no longer forces direct SSH for the daemon's lifetime.
+- [x] Claim text/image hashes before `wl-copy` / `pbcopy`, so `wl-paste --watch` cannot echo payloads (2–4 extra round trips per copy).
+- [x] macOS daemon: 50ms poll, `.common` run-loop mode, App Nap guard, FIFO inode reuse, and a 1s retry for transient empty pasteboard states.
+- [x] Notifications run detached; safety-net text poll is 5s (images 60s) when `poll_interval` is small.
+
 ## Not now
+
+### Persistent push channel
+
+Linux→Mac still pays one SSH channel setup plus a remote `pbcopy` process per copy; on Wi-Fi that is ~150–250ms. A long-lived in-process apply channel (SSH stdio or daemon socket) would remove both, but it needs a coordinated Mac helper and reconnect protocol. Do it only if the remaining latency is still unacceptable after wired Ethernet and the fixes above.
 
 ### WebSocket relay
 

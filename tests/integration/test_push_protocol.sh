@@ -35,7 +35,14 @@ with_lock write_text_hash "def"
 [[ "$(read_text_hash)" == "def" ]] || fail "with_lock write"
 pass "state + flock"
 
-apply_text_to_linux() { printf '%s' "$1" > "$TEST_HOME/applied_text"; return 0; }
+apply_text_to_linux() {
+    # The inbound path must claim the hash before wl-copy; otherwise the
+    # wl-paste --watch worker echoes the text back to the Mac.
+    [[ "$(read_text_hash)" == "$(get_text_hash "$1")" ]] \
+        || fail "text hash not claimed before wl-copy"
+    printf '%s' "$1" > "$TEST_HOME/applied_text"
+    return 0
+}
 notify_linux() { :; }
 ENABLE_TEXT=true
 MIN_LENGTH=1

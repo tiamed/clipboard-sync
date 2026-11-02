@@ -440,6 +440,12 @@ notify_macos() {
         ssh_pipe "export LC_CTYPE=en_US.UTF-8; osascript -" || true
 }
 
+# Notifications are not part of the clipboard path. osascript over SSH used to
+# cost another 300-900ms on a cold connection and blocked the worker, delaying
+# the next copy. Run them detached and never wait for them.
+notify_linux_async() { ( notify_linux "$@" ) >/dev/null 2>&1 & }
+notify_macos_async() { ( notify_macos "$@" ) >/dev/null 2>&1 & }
+
 # === PUSH / APPLY ===
 push_text_to_macos() {
     local text="$1"
@@ -485,11 +491,15 @@ handle_linux_text_change() {
         return 1
     fi
 
+    # Claim before the push. The Mac daemon echoes the clipboard back as soon
+    # as pbcopy lands; if the hash is still old, the inbound apply re-triggers
+    # this worker and produces a 2-4 event echo loop.
+    with_lock write_text_hash "$current_hash"
     if push_text_to_macos "$linux_text"; then
-        with_lock write_text_hash "$current_hash"
         log_info "→ macOS text (${#linux_text} chars)"
-        notify_macos "Clipboard Sync" "$linux_text"
+        notify_macos_async "Clipboard Sync" "$linux_text"
     else
+        with_lock write_text_hash "$last"
         log_error "→ macOS text push failed"
         return 1
     fi
@@ -523,11 +533,12 @@ handle_linux_image_change() {
         return 1
     fi
 
+    with_lock write_image_hash "$current_hash"
     if push_image_to_macos "$tmp_img"; then
-        with_lock write_image_hash "$current_hash"
         log_info "→ macOS image"
-        notify_macos "Clipboard Sync" "Image received from Linux"
+        notify_macos_async "Clipboard Sync" "Image received from Linux"
     else
+        with_lock write_image_hash "$last"
         log_error "→ macOS image push failed"
         rm -f "$tmp_img"
         return 1
@@ -621,11 +632,15 @@ apply_macos_text_payload() {
     last=$(read_text_hash)
     [[ "$current_hash" == "$last" ]] && return 0
 
+    # Claim the hash BEFORE wl-copy. wl-copy fires wl-paste --watch
+    # synchronously, and the outbound worker was reading the old hash and
+    # echoing the same text back to the Mac (2-4 extra round trips per copy).
+    with_lock write_text_hash "$current_hash"
     if apply_text_to_linux "$mac_text"; then
-        with_lock write_text_hash "$current_hash"
         log_info "← Linux text (${#mac_text} chars) [push]"
-        notify_linux "Clipboard Sync" "$mac_text"
+        notify_linux_async "Clipboard Sync" "$mac_text"
     else
+        with_lock write_text_hash "$last"
         log_error "← wl-copy text failed"
         return 1
     fi
@@ -659,11 +674,12 @@ apply_macos_imgfile() {
         return 0
     fi
 
+    with_lock write_image_hash "$current_hash"
     if apply_image_to_linux "$tmp_img"; then
-        with_lock write_image_hash "$current_hash"
         log_info "← Linux image [push]"
-        notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+        notify_linux_async "Clipboard Sync [IMAGE]" "Image copied"
     else
+        with_lock write_image_hash "$last"
         log_error "← wl-copy image failed"
         rm -f "$tmp_img"
         return 1
@@ -688,11 +704,12 @@ apply_macos_img_b64() {
         rm -f "$tmp_img"
         return 0
     fi
+    with_lock write_image_hash "$current_hash"
     if apply_image_to_linux "$tmp_img"; then
-        with_lock write_image_hash "$current_hash"
         log_info "← Linux image [push-b64]"
-        notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+        notify_linux_async "Clipboard Sync [IMAGE]" "Image copied"
     else
+        with_lock write_image_hash "$last"
         log_error "← wl-copy image failed"
         rm -f "$tmp_img"
         return 1
@@ -843,10 +860,13 @@ pull_macos_text_once() {
     local last
     last=$(read_text_hash)
     [[ "$current_hash" == "$last" ]] && return 0
+    with_lock write_text_hash "$current_hash"
     if apply_text_to_linux "$mac_text"; then
-        with_lock write_text_hash "$current_hash"
         log_info "← Linux text (${#mac_text} chars) [poll]"
-        notify_linux "Clipboard Sync" "$mac_text"
+        notify_linux_async "Clipboard Sync" "$mac_text"
+    else
+        with_lock write_text_hash "$last"
+        return 1
     fi
 }
 
@@ -869,10 +889,12 @@ pull_macos_image_once() {
     current_hash=$(get_image_hash "$tmp_img")
     last=$(read_image_hash)
     if [[ "$current_hash" != "$last" ]]; then
+        with_lock write_image_hash "$current_hash"
         if apply_image_to_linux "$tmp_img"; then
-            with_lock write_image_hash "$current_hash"
             log_info "← Linux image [poll]"
-            notify_linux "Clipboard Sync [IMAGE]" "Image copied"
+            notify_linux_async "Clipboard Sync [IMAGE]" "Image copied"
+        else
+            with_lock write_image_hash "$last"
         fi
     fi
     rm -f "$tmp_img"
@@ -887,17 +909,24 @@ run_inbound_poll_worker() {
     done
 }
 
-# Rare safety net when push mode is active
+# Rare safety net when push mode is active. Text is cheap (one pbpaste);
+# images are not, so keep them on a slower cadence.
 run_safety_net_worker() {
     local interval="$POLL_INTERVAL"
-    [[ "$interval" -lt 15 ]] && interval=30
-    log_info "Safety-net poll every ${interval}s"
+    [[ "$interval" -lt 5 ]] && interval=5
+    local image_interval=60
+    local last_image=0
+    log_info "Safety-net poll every ${interval}s (images every ${image_interval}s)"
     while true; do
         sleep "$interval"
         ensure_ssh_master || continue
         pull_macos_text_once || true
-        # Image safety net is heavier; only every other cycle-ish by sleeping more
-        pull_macos_image_once || true
+        local now
+        now=$(date +%s)
+        if (( now - last_image >= image_interval )); then
+            pull_macos_image_once || true
+            last_image=$now
+        fi
     done
 }
 
@@ -1041,8 +1070,11 @@ run_daemon() {
         if ensure_ssh_master; then
             log_info "SSH multiplexing ready (persist ${SSH_MUX_PERSIST}s)"
         else
-            log_warn "SSH multiplexing failed; direct connections (higher latency)"
-            SSH_MUX_ENABLED="false"
+            # Keep mux enabled: ensure_ssh_master() retries on every outbound
+            # event and every supervisor tick. Disabling it here made a single
+            # startup failure (Mac asleep/offline) permanent, so every later
+            # copy paid a full SSH handshake.
+            log_warn "SSH multiplexing failed; retrying (direct connections until master is up)"
         fi
     fi
 

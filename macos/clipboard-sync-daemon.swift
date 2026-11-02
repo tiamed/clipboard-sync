@@ -78,25 +78,36 @@ final class IPCChannel {
     }
 
     private func setupFIFO() {
-        if FileManager.default.fileExists(atPath: fifoPath) {
+        var st = stat()
+        if lstat(fifoPath, &st) == 0 {
+            // Reuse the existing inode. Removing and recreating the FIFO on a
+            // daemon restart orphaned the Linux-side `ssh cat` reader on the
+            // old inode, so events silently queued for seconds.
+            guard (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFIFO) else {
+                log("ERROR", "\(fifoPath) exists but is not a FIFO - refusing to replace it")
+                return
+            }
             do {
                 let attrs = try FileManager.default.attributesOfItem(atPath: fifoPath)
                 let fileOwner = attrs[.ownerAccountID] as? NSNumber
                 let currentUser = getuid()
                 if fileOwner?.uint32Value != currentUser {
-                    log("ERROR", "FIFO exists but is not owned by current user - refusing to remove")
+                    log("ERROR", "FIFO exists but is not owned by current user - refusing to use it")
                     return
                 }
-                try FileManager.default.removeItem(atPath: fifoPath)
             } catch {
-                log("ERROR", "Failed to check/remove existing FIFO: \(error)")
+                log("ERROR", "Failed to inspect existing FIFO: \(error)")
                 return
             }
-        }
-
-        let rc = mkfifo(fifoPath, 0o600)
-        if rc != 0 {
-            log("ERROR", "mkfifo failed: \(errno)")
+            log("INFO", "reusing existing FIFO at \(fifoPath)")
+        } else if errno == ENOENT {
+            let rc = mkfifo(fifoPath, 0o600)
+            if rc != 0 {
+                log("ERROR", "mkfifo failed: \(errno)")
+                return
+            }
+        } else {
+            log("ERROR", "lstat failed for \(fifoPath): \(errno)")
             return
         }
 
@@ -189,12 +200,16 @@ final class IPCChannel {
 }
 
 final class ClipboardMonitor {
-    /// Fixed snappy interval — idle backoff made Mac→Linux feel multi-second after quiet periods.
-    private let pollInterval: TimeInterval = 0.1
+    /// NSPasteboard has no change notification; 50ms bounds the added latency
+    /// while keeping the changeCount check cheap.
+    private let pollInterval: TimeInterval = 0.05
     private var lastChangeCount = NSPasteboard.general.changeCount
+    private var pendingChangeCount = -1
+    private var pendingSince: TimeInterval = 0
     private let ipc: IPCChannel
     private let imagePath: String
     private var timer: Timer?
+    private var activity: NSObjectProtocol?
 
     init(ipc: IPCChannel, imagePath: String) {
         self.ipc = ipc
@@ -202,29 +217,54 @@ final class ClipboardMonitor {
     }
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+        // App Nap can coalesce a background agent's timers to seconds. Keep the
+        // monitor exempt so the 50ms poll actually fires while the Mac is idle.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "clipboard-sync event latency"
+        )
+        let t = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        // .common keeps the timer alive during tracking/modal run-loop modes.
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
         RunLoop.main.run()
     }
 
     private func tick() {
         let pb = NSPasteboard.general
         let current = pb.changeCount
-        if current != lastChangeCount {
+        guard current != lastChangeCount else { return }
+
+        // changeCount can advance when the pasteboard is cleared, before the
+        // owner has written the new representation. Retry the same count for up
+        // to a second instead of dropping the event (which only the 30s
+        // safety-net poll would repair).
+        let now = Date().timeIntervalSince1970
+        if current != pendingChangeCount {
+            pendingChangeCount = current
+            pendingSince = now
+        }
+
+        if handleChange(pb) {
             lastChangeCount = current
-            handleChange(pb)
+            pendingChangeCount = -1
+        } else if now - pendingSince >= 1.0 {
+            lastChangeCount = current
+            pendingChangeCount = -1
+            log("DEBUG", "clipboard change has no supported content; skipping")
         }
     }
 
-    private func handleChange(_ pb: NSPasteboard) {
+    private func handleChange(_ pb: NSPasteboard) -> Bool {
         // Prefer text when present (common for mixed pasteboards).
         if let text = pb.string(forType: .string), !text.isEmpty {
             let b64 = Data(text.utf8).base64EncodedString()
             let payload = "TEXT:\(b64)"
             ipc.broadcast(event: Data(payload.utf8))
             log("INFO", "pushed TEXT (\(text.utf8.count) bytes)")
-            return
+            return true
         }
 
         // Images: write PNG to a stable path and signal IMGFILE (avoids huge FIFO lines).
@@ -234,13 +274,13 @@ final class ClipboardMonitor {
                 let payload = "IMGFILE:\(imagePath)"
                 ipc.broadcast(event: Data(payload.utf8))
                 log("INFO", "pushed IMGFILE \(imagePath) (\(png.count) bytes)")
+                return true
             } catch {
                 log("ERROR", "failed to write image: \(error)")
             }
-            return
         }
 
-        log("DEBUG", "clipboard changed but no supported content")
+        return false
     }
 
     private func pngData(from pb: NSPasteboard) -> Data? {
